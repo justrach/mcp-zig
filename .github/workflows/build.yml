@@ -19,7 +19,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.15.1
+          version: 0.15.2
 
       - name: Build (debug)
         run: zig build
