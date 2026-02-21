@@ -50,7 +50,7 @@ pub fn Registry(comptime defs: []const ToolDef) type {
         }
 
         /// Combined tools/list JSON response, generated at comptime.
-        pub const tools_list = comptime blk: {
+        pub const tools_list = blk: {
             var buf: []const u8 = "{\"tools\":[";
             for (defs, 0..) |def, i| {
                 if (i > 0) buf = buf ++ ",";
@@ -64,7 +64,7 @@ pub fn Registry(comptime defs: []const ToolDef) type {
         pub const count = defs.len;
 
         /// Get tool name by index.
-        pub fn name(index: usize) []const u8 {
+        pub fn nameAt(index: usize) []const u8 {
             inline for (defs, 0..) |def, i| {
                 if (index == i) return def.name;
             }
