@@ -90,11 +90,51 @@ Requires [Zig 0.15](https://ziglang.org/download/).
 
 ---
 
+## Use as a Zig package
+
+Instead of cloning, you can import mcp-zig as a dependency in your own Zig project.
+
+**1. Add to your `build.zig.zon`:**
+```zig
+.dependencies = .{
+    .mcp_zig = .{
+        .url = "https://github.com/justrach/mcp-zig/archive/main.tar.gz",
+        .hash = "...",  // zig build will tell you the correct hash
+    },
+},
+```
+
+**2. Wire it in your `build.zig`:**
+```zig
+const mcp_dep = b.dependency("mcp_zig", .{});
+exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
+```
+
+**3. Import in your code:**
+```zig
+const mcp = @import("mcp");
+
+// Use the client
+const McpClient = mcp.client.McpClient;
+var client = try McpClient.init(alloc, &.{"/path/to/server"}, null);
+
+// Use the registry
+const my_tools = mcp.registry.Registry(&.{
+    .{ .name = "my_tool", .handler = myHandler, .schema = my_schema },
+});
+
+// Use JSON helpers
+const value = mcp.json.getStr(args, "key");
+```
+
+---
+
 ## Structure
 
 ```
 src/
   main.zig           — entry point (5 lines of logic)
+  lib.zig            — package root (re-exports public API)
   mcp.zig            — MCP protocol loop (JSON-RPC 2.0 over stdio)
   tools.zig          — YOUR TOOLS GO HERE (read_file + list_dir as examples)
   json.zig           — line reader, field extraction, JSON escaping
@@ -102,6 +142,7 @@ src/
   client.zig         — MCP client library (spawn server, call tools)
   client_example.zig — client CLI example
 build.zig
+build.zig.zon        — package manifest
 ```
 
 **To add your own tools**, edit `tools.zig`. Or use `registry.zig` to cut it down to a single definition.
@@ -250,6 +291,18 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per line, no Content-Length headers (unlike LSP). The critical invariant: every write to stdout is exactly one JSON object followed by `\n`.
 
 The `writeResult` function in `mcp.zig` strips `\n` and `\r` from result strings before writing. This matters because Zig `\\` multiline string literals embed literal newlines — without stripping, Claude Code's ReadBuffer would parse each line as a separate (invalid) JSON-RPC message and kill the server.
+
+---
+
+## Coming soon
+
+- More example tools (database queries, HTTP requests, file watchers)
+- Cross-compilation targets (Linux, Windows from macOS)
+- Streamable HTTP transport (beyond stdio)
+- Tool composition — chain tools together within a single server
+- Benchmark suite for latency and throughput profiling
+
+Have ideas? [Open an issue](https://github.com/justrach/mcp-zig/issues).
 
 ---
 
