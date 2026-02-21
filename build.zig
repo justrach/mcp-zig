@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target   = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── Library module (for consumers using mcp-zig as a dependency) ──────────
+    _ = b.addModule("mcp", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target   = target,
+        .optimize = optimize,
+    });
+
+    // ── Standalone server executable ─────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "mcp-zig",
         .root_module = b.createModule(.{
@@ -20,7 +28,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the MCP server");
     run_step.dependOn(&run_cmd.step);
 
-    // zig build client — build the MCP client example
+    // ── Client example executable ────────────────────────────────────────────
     const client_exe = b.addExecutable(.{
         .name = "mcp-client",
         .root_module = b.createModule(.{
