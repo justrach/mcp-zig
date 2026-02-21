@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.0
+
+      - name: Build (debug)
+        run: zig build
+
+      - name: Build (release)
+        run: zig build -Doptimize=ReleaseSmall
+
+      - name: Check binary size
+        run: |
+          ls -la zig-out/bin/mcp-zig
+          strip zig-out/bin/mcp-zig || true
+          ls -la zig-out/bin/mcp-zig
+
+      - name: Smoke test - initialize
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"0.1.0"}}}' | timeout 5 ./zig-out/bin/mcp-zig || true

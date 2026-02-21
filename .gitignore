@@ -1,0 +1,10 @@
+.DS_Store
+.zig-cache/
+zig-out/
+.claude/
+*.bak
+*~
+.idea/
+.cursor/
+.vscode/
+posts/
