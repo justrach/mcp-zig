@@ -1,5 +1,6 @@
 // mcp-zig — MCP server (Model Context Protocol, JSON-RPC 2.0 over stdio)
 //
+// Protocol version: 2025-06-18
 // Protocol: newline-delimited JSON. NO Content-Length headers (unlike LSP).
 // Claude Code's ReadBuffer parses one JSON object per line — a single \n
 // inside a result would be interpreted as a new (invalid) request.
@@ -14,14 +15,62 @@
 //   3. Sends {"jsonrpc":"2.0","method":"notifications/initialized"} (no id)
 //   4. Sends tools/list, tools/call as needed
 //   5. Process exits when stdin closes
+//
+// 2025-06-18 additions:
+//   - Parses client capabilities from initialize request
+//   - Requests workspace roots if client supports the roots capability
+//   - Handles notifications/roots/list_changed to track root changes
+//   - Server can send JSON-RPC requests to the client (writeRequest)
+//   - Title field in serverInfo for human-readable display name
 
 const std = @import("std");
 const json = @import("json.zig");
 const tools = @import("tools.zig");
 
+/// Workspace root provided by the client via the roots capability.
+/// URIs use file:// scheme. Roots scope the server's view of the filesystem.
+pub const Root = struct {
+    uri: []u8,
+    name: []u8,
+};
+
+/// MCP session state — tracks client capabilities and workspace roots.
+const Session = struct {
+    alloc: std.mem.Allocator,
+    stdout: std.fs.File,
+    next_id: i64 = 100, // start high to avoid collision with client IDs
+
+    // Client capabilities (parsed from initialize request)
+    client_supports_roots: bool = false,
+    client_roots_list_changed: bool = false,
+
+    // Server-to-client request tracking
+    pending_roots_id: ?i64 = null,
+
+    // Workspace roots from the client
+    roots: std.ArrayList(Root) = .empty,
+
+    fn freeRoots(self: *Session) void {
+        for (self.roots.items) |r| {
+            self.alloc.free(r.uri);
+            self.alloc.free(r.name);
+        }
+        self.roots.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *Session) void {
+        self.freeRoots();
+        self.roots.deinit(self.alloc);
+    }
+};
+
 pub fn run(alloc: std.mem.Allocator) void {
-    const stdout = std.fs.File.stdout();
-    const stdin  = std.fs.File.stdin();
+    var session: Session = .{
+        .alloc = alloc,
+        .stdout = std.fs.File.stdout(),
+    };
+    defer session.deinit();
+    const stdin = std.fs.File.stdin();
 
     while (true) {
         const line = json.readLine(alloc, stdin) orelse break;
@@ -31,48 +80,135 @@ pub fn run(alloc: std.mem.Allocator) void {
         if (input.len == 0) continue;
 
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-            writeError(alloc, stdout, null, -32700, "Parse error");
+            writeError(alloc, session.stdout, null, -32700, "Parse error");
             continue;
         };
         defer parsed.deinit();
 
         if (parsed.value != .object) {
-            writeError(alloc, stdout, null, -32600, "Invalid Request");
+            writeError(alloc, session.stdout, null, -32600, "Invalid Request");
             continue;
         }
 
-        const root   = &parsed.value.object;
-        const method = json.getStr(root, "method") orelse {
-            writeError(alloc, stdout, null, -32600, "Missing method");
-            continue;
-        };
-        const id = root.get("id"); // null for notifications
+        const root = &parsed.value.object;
 
-        if (json.eql(method, "initialize")) {
-            handleInitialize(alloc, stdout, id);
-        } else if (json.eql(method, "notifications/initialized")) {
-            // notification — no response
-        } else if (json.eql(method, "tools/list")) {
-            writeResult(alloc, stdout, id, tools.tools_list);
-        } else if (json.eql(method, "tools/call")) {
-            handleCall(alloc, root, stdout, id);
-        } else if (json.eql(method, "ping")) {
-            writeResult(alloc, stdout, id, "{}");
+        // Dispatch: requests/notifications have "method", responses do not
+        if (json.getStr(root, "method")) |method| {
+            const id = root.get("id");
+
+            if (json.eql(method, "initialize")) {
+                handleInitialize(&session, root, id);
+            } else if (json.eql(method, "notifications/initialized")) {
+                // Post-handshake: request workspace roots if client supports them
+                if (session.client_supports_roots) requestRoots(&session);
+            } else if (json.eql(method, "notifications/roots/list_changed")) {
+                // Client's workspace roots changed — re-query
+                if (session.client_supports_roots) requestRoots(&session);
+            } else if (json.eql(method, "tools/list")) {
+                writeResult(alloc, session.stdout, id, tools.tools_list);
+            } else if (json.eql(method, "tools/call")) {
+                handleCall(alloc, root, session.stdout, id);
+            } else if (json.eql(method, "ping")) {
+                writeResult(alloc, session.stdout, id, "{}");
+            } else {
+                if (id != null) writeError(alloc, session.stdout, id, -32601, "Method not found");
+            }
+        } else if (root.get("result") != null or root.get("error") != null) {
+            // Response to a server-initiated request
+            handleResponse(&session, root);
         } else {
-            if (id != null) writeError(alloc, stdout, id, -32601, "Method not found");
+            writeError(alloc, session.stdout, null, -32600, "Missing method");
         }
     }
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
 //
-// Respond with protocol version + server capabilities.
+// Parse client capabilities and respond with server capabilities.
 // Change "name" and "version" to match your server.
 
-fn handleInitialize(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value) void {
-    writeResult(alloc, stdout, id,
-        \\{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mcp-zig","version":"1.0.0"}}
+fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.Value) void {
+    // Parse client capabilities from params.capabilities
+    caps: {
+        const p = root.get("params") orelse break :caps;
+        if (p != .object) break :caps;
+        const c = p.object.get("capabilities") orelse break :caps;
+        if (c != .object) break :caps;
+        const r = c.object.get("roots") orelse break :caps;
+        s.client_supports_roots = true;
+        if (r == .object) {
+            var obj = r.object;
+            s.client_roots_list_changed = json.getBool(&obj, "listChanged");
+        }
+    }
+
+    writeResult(s.alloc, s.stdout, id,
+        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"}}
     );
+}
+
+// ── roots ──────────────────────────────────────────────────────────────────
+//
+// Server-to-client request: ask the client for its workspace roots.
+// The client responds with an array of Root objects (uri + optional name).
+
+fn requestRoots(s: *Session) void {
+    const id = s.next_id;
+    s.next_id += 1;
+    s.pending_roots_id = id;
+    writeRequest(s.alloc, s.stdout, id, "roots/list", "{}");
+}
+
+fn handleResponse(s: *Session, root: *const std.json.ObjectMap) void {
+    const resp_id_val = root.get("id") orelse return;
+    const resp_id = switch (resp_id_val) {
+        .integer => |n| n,
+        else => return,
+    };
+
+    if (s.pending_roots_id) |rid| {
+        if (resp_id == rid) {
+            s.pending_roots_id = null;
+            if (root.get("result")) |result_val| {
+                if (result_val == .object) {
+                    var result_obj = result_val.object;
+                    parseRoots(s, &result_obj);
+                }
+            }
+            // If "error" instead of "result", client doesn't support roots — ignore
+        }
+    }
+}
+
+fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
+    s.freeRoots();
+    const roots_val = result.get("roots") orelse return;
+    if (roots_val != .array) return;
+
+    for (roots_val.array.items) |item| {
+        if (item != .object) continue;
+        var obj = item.object;
+        const uri_raw = json.getStr(&obj, "uri") orelse continue;
+        const name_raw = json.getStr(&obj, "name") orelse "";
+        const uri = s.alloc.dupe(u8, uri_raw) catch continue;
+        const name = s.alloc.dupe(u8, name_raw) catch {
+            s.alloc.free(uri);
+            continue;
+        };
+        s.roots.append(s.alloc, .{ .uri = uri, .name = name }) catch {
+            s.alloc.free(uri);
+            s.alloc.free(name);
+        };
+    }
+
+    // Log roots to stderr for debugging (stderr is not part of the MCP protocol)
+    for (s.roots.items) |r| {
+        if (r.name.len > 0) {
+            std.debug.print("[mcp-zig] root: {s} ({s})\n", .{ r.uri, r.name });
+        } else {
+            std.debug.print("[mcp-zig] root: {s}\n", .{r.uri});
+        }
+    }
 }
 
 // ── tools/call ────────────────────────────────────────────────────────────
@@ -125,7 +261,7 @@ fn handleCall(
     writeResult(alloc, stdout, id, result.items);
 }
 
-// ── JSON-RPC 2.0 response writers ──────────────────────────────────────────────
+// ── JSON-RPC 2.0 writers ────────────────────────────────────────────────────
 
 /// Write a JSON-RPC 2.0 result response.
 /// IMPORTANT: strips \n and \r from `result` before writing.
@@ -171,6 +307,30 @@ fn writeError(
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
     json.writeEscaped(alloc, &buf, msg);
     buf.appendSlice(alloc, "\"}}\n") catch return;
+
+    _ = stdout.write(buf.items) catch 0;
+}
+
+/// Write a JSON-RPC 2.0 request (server → client).
+fn writeRequest(
+    alloc: std.mem.Allocator,
+    stdout: std.fs.File,
+    id: i64,
+    method: []const u8,
+    params: []const u8,
+) void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    var tmp: [20]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&tmp, "{d}", .{id}) catch return;
+    buf.appendSlice(alloc, id_str) catch return;
+    buf.appendSlice(alloc, ",\"method\":\"") catch return;
+    buf.appendSlice(alloc, method) catch return;
+    buf.appendSlice(alloc, "\",\"params\":") catch return;
+    buf.appendSlice(alloc, params) catch return;
+    buf.appendSlice(alloc, "}\n") catch return;
 
     _ = stdout.write(buf.items) catch 0;
 }

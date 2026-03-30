@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build](https://github.com/justrach/mcp-zig/actions/workflows/build.yml/badge.svg)](https://github.com/justrach/mcp-zig/actions)
 [![Zig](https://img.shields.io/badge/Zig-0.15-f7a41d.svg)](https://ziglang.org)
+[![MCP](https://img.shields.io/badge/MCP-2025--06--18-green.svg)](https://spec.modelcontextprotocol.io)
 
 **Build MCP servers that fit in a tweet-sized binary.**
 
@@ -135,14 +136,14 @@ const value = mcp.json.getStr(args, "key");
 src/
   main.zig           — entry point (5 lines of logic)
   lib.zig            — package root (re-exports public API)
-  mcp.zig            — MCP protocol loop (JSON-RPC 2.0 over stdio)
+  mcp.zig            — MCP protocol loop + session state (roots, capabilities)
   tools.zig          — YOUR TOOLS GO HERE (read_file + list_dir as examples)
   json.zig           — line reader, field extraction, JSON escaping
   registry.zig       — comptime tool registry (optional, reduces boilerplate)
   client.zig         — MCP client library (spawn server, call tools)
   client_example.zig — client CLI example
 build.zig
-build.zig.zon        — package manifest
+build.zig.zon        — package manifest (v0.2.0)
 ```
 
 **To add your own tools**, edit `tools.zig`. Or use `registry.zig` to cut it down to a single definition.
@@ -288,18 +289,54 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 
 ## Protocol notes
 
+**Protocol version: 2025-06-18** ([spec](https://spec.modelcontextprotocol.io))
+
 MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per line, no Content-Length headers (unlike LSP). The critical invariant: every write to stdout is exactly one JSON object followed by `\n`.
 
 The `writeResult` function in `mcp.zig` strips `\n` and `\r` from result strings before writing. This matters because Zig `\\` multiline string literals embed literal newlines — without stripping, Claude Code's ReadBuffer would parse each line as a separate (invalid) JSON-RPC message and kill the server.
+
+### What's new in v0.2.0 (2025-06-18 protocol)
+
+| Feature | Description |
+|---------|------------|
+| **Client capability parsing** | Server reads `params.capabilities` from the `initialize` request |
+| **Workspace roots** | After handshake, server sends `roots/list` to discover client workspace directories |
+| **Roots change tracking** | Handles `notifications/roots/list_changed` — re-queries roots automatically |
+| **Bidirectional JSON-RPC** | New `writeRequest()` for server-to-client requests (not just responses) |
+| **Title field** | `serverInfo` includes `title` for human-readable display names |
+| **Session state** | `Session` struct tracks capabilities, pending requests, and parsed roots across the connection |
+
+The server now participates in the full MCP lifecycle:
+
+```
+Client                          Server
+  │                               │
+  ├─ initialize ─────────────────►│  ← parses client capabilities
+  │◄──────────────── result ──────┤  ← returns 2025-06-18 + tools cap
+  │                               │
+  ├─ notifications/initialized ──►│
+  │◄──────────── roots/list ──────┤  ← if client supports roots
+  ├─ result (roots array) ───────►│  ← stores workspace roots
+  │                               │
+  ├─ tools/list ─────────────────►│
+  │◄──────────────── result ──────┤
+  │                               │
+  ├─ notifications/roots/list_changed ►│
+  │◄──────────── roots/list ──────┤  ← re-queries on change
+  ├─ result (updated roots) ─────►│
+```
 
 ---
 
 ## Coming soon
 
+- Structured tool output (`outputSchema` / `structuredContent`)
+- Elicitation — server requesting user input via client UI
+- Resource links — returning `ResourceLink` content blocks from tools
+- Completions — autocomplete for tool arguments
+- Streamable HTTP transport (beyond stdio)
 - More example tools (database queries, HTTP requests, file watchers)
 - Cross-compilation targets (Linux, Windows from macOS)
-- Streamable HTTP transport (beyond stdio)
-- Tool composition — chain tools together within a single server
 - Benchmark suite for latency and throughput profiling
 
 Have ideas? [Open an issue](https://github.com/justrach/mcp-zig/issues).

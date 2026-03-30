@@ -3,6 +3,10 @@
 // Spawns an MCP server as a child process and communicates via stdin/stdout.
 // Handles the full lifecycle: initialize → tools/list → tools/call → exit.
 //
+// Protocol version: 2025-06-18
+// Handles server-to-client requests (e.g. roots/list) that may arrive
+// interleaved between the client's own request/response pairs.
+//
 // Usage:
 //   var client = try McpClient.init(alloc, &.{"/path/to/server"}, null);
 //   defer client.deinit();
@@ -51,7 +55,7 @@ pub const McpClient = struct {
     /// Send initialize and wait for response. Returns server info as raw JSON string.
     pub fn initialize(self: *McpClient) ![]u8 {
         const req =
-            \\{"jsonrpc":"2.0","id":__ID__,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcp-zig-client","version":"1.0.0"}}}
+            \\{"jsonrpc":"2.0","id":__ID__,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"mcp-zig-client","version":"1.0.0"}}}
         ;
         return self.sendAndReceive(req);
     }
@@ -135,15 +139,32 @@ pub const McpClient = struct {
         return self.readResponse();
     }
 
+    /// Read the next JSON-RPC response from the server.
+    /// Transparently handles interleaved server-to-client requests (e.g. roots/list)
+    /// by responding to them and continuing to read until a response arrives.
     fn readResponse(self: *McpClient) ![]u8 {
-        const stdout = self.process.stdout orelse return error.StdoutClosed;
-        const stdout_file = stdout;
+        while (true) {
+            const line = try self.readOneLine();
 
-        // Read one line (JSON-RPC response)
+            // Check if this is a server-to-client request (has "method", no "result")
+            // If so, respond and keep reading for our actual response.
+            if (self.handleServerRequest(line)) {
+                self.alloc.free(line);
+                continue;
+            }
+
+            return line;
+        }
+    }
+
+    /// Read exactly one newline-terminated line from the server's stdout.
+    fn readOneLine(self: *McpClient) ![]u8 {
+        const stdout = self.process.stdout orelse return error.StdoutClosed;
+
         var line: std.ArrayList(u8) = .empty;
         var byte_buf: [1]u8 = undefined;
         while (true) {
-            const n = try stdout_file.read(&byte_buf);
+            const n = try stdout.read(&byte_buf);
             if (n == 0) {
                 line.deinit(self.alloc);
                 return error.ServerClosed;
@@ -163,6 +184,95 @@ pub const McpClient = struct {
             line.deinit(self.alloc);
             return error.OutOfMemory;
         };
+    }
+
+    /// If `line` is a server-to-client request (has "method" field), respond and return true.
+    /// Returns false for normal responses — caller should return the line as-is.
+    fn handleServerRequest(self: *McpClient, line: []const u8) bool {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.alloc, line, .{}) catch return false;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return false;
+        const obj = &parsed.value.object;
+
+        // Responses have "result" or "error" but no "method"
+        const method = json.getStr(obj, "method") orelse return false;
+        const id = obj.get("id");
+
+        if (json.eql(method, "roots/list")) {
+            // Respond with workspace roots (cwd by default)
+            self.respondRoots(id);
+        } else {
+            // Unknown server request — send method-not-found error
+            self.respondError(id, -32601, "Method not found");
+        }
+        return true;
+    }
+
+    /// Respond to a roots/list request with the client's workspace roots.
+    /// By default, reports the current working directory.
+    fn respondRoots(self: *McpClient, id: ?std.json.Value) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+
+        buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+        appendId(self.alloc, &buf, id);
+        buf.appendSlice(self.alloc, ",\"result\":{\"roots\":[{\"uri\":\"file://") catch return;
+
+        // Use cwd as the default root
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch {
+            // Fallback: empty roots
+            buf.clearRetainingCapacity();
+            buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+            appendId(self.alloc, &buf, id);
+            buf.appendSlice(self.alloc, ",\"result\":{\"roots\":[]}}\n") catch return;
+            const stdin = self.process.stdin orelse return;
+            _ = stdin.write(buf.items) catch {};
+            return;
+        };
+        json.writeEscaped(self.alloc, &buf, cwd);
+        buf.appendSlice(self.alloc, "\",\"name\":\"workspace\"}]}}\n") catch return;
+
+        const stdin = self.process.stdin orelse return;
+        _ = stdin.write(buf.items) catch {};
+    }
+
+    /// Send a JSON-RPC error response to the server.
+    fn respondError(self: *McpClient, id: ?std.json.Value, code: i32, msg: []const u8) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+
+        buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+        appendId(self.alloc, &buf, id);
+        buf.appendSlice(self.alloc, ",\"error\":{\"code\":") catch return;
+        var tmp: [12]u8 = undefined;
+        const cs = std.fmt.bufPrint(&tmp, "{d}", .{code}) catch return;
+        buf.appendSlice(self.alloc, cs) catch return;
+        buf.appendSlice(self.alloc, ",\"message\":\"") catch return;
+        json.writeEscaped(self.alloc, &buf, msg);
+        buf.appendSlice(self.alloc, "\"}}\n") catch return;
+
+        const stdin = self.process.stdin orelse return;
+        _ = stdin.write(buf.items) catch {};
+    }
+
+    fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
+        if (id) |v| switch (v) {
+            .integer => |n| {
+                var tmp: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return;
+                buf.appendSlice(alloc, s) catch return;
+            },
+            .string => |s| {
+                buf.append(alloc, '"') catch return;
+                json.writeEscaped(alloc, buf, s);
+                buf.append(alloc, '"') catch return;
+            },
+            else => buf.appendSlice(alloc, "null") catch return,
+        } else {
+            buf.appendSlice(alloc, "null") catch return;
+        }
     }
 };
 
