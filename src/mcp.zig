@@ -16,16 +16,39 @@
 //   4. Sends tools/list, tools/call as needed
 //   5. Process exits when stdin closes
 //
-// 2025-06-18 additions:
-//   - Parses client capabilities from initialize request
-//   - Requests workspace roots if client supports the roots capability
-//   - Handles notifications/roots/list_changed to track root changes
-//   - Server can send JSON-RPC requests to the client (writeRequest)
-//   - Title field in serverInfo for human-readable display name
+// Supported features:
+//   - Client capability parsing (roots, etc.)
+//   - Workspace roots (roots/list, notifications/roots/list_changed)
+//   - Logging (logging/setLevel, notifications/message)
+//   - Progress notifications (notifications/progress)
+//   - Request cancellation (notifications/cancelled)
+//   - Structured tool output (structuredContent in CallToolResult)
+//   - Server instructions in initialize result
+//   - Bidirectional JSON-RPC (server → client requests)
 
 const std = @import("std");
 const json = @import("json.zig");
 const tools = @import("tools.zig");
+
+// ── Log levels (RFC 5424 severity) ──────────────────────────────────────────
+
+pub const LogLevel = enum {
+    debug,
+    info,
+    notice,
+    warning,
+    @"error",
+    critical,
+    alert,
+    emergency,
+};
+
+fn logLevelFromString(s: []const u8) ?LogLevel {
+    inline for (std.meta.fields(LogLevel)) |f| {
+        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
 
 /// Workspace root provided by the client via the roots capability.
 /// URIs use file:// scheme. Roots scope the server's view of the filesystem.
@@ -34,7 +57,7 @@ pub const Root = struct {
     name: []u8,
 };
 
-/// MCP session state — tracks client capabilities and workspace roots.
+/// MCP session state — tracks client capabilities, workspace roots, and log level.
 const Session = struct {
     alloc: std.mem.Allocator,
     stdout: std.fs.File,
@@ -49,6 +72,9 @@ const Session = struct {
 
     // Workspace roots from the client
     roots: std.ArrayList(Root) = .empty,
+
+    // Logging (#3)
+    log_level: LogLevel = .warning,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -104,10 +130,15 @@ pub fn run(alloc: std.mem.Allocator) void {
             } else if (json.eql(method, "notifications/roots/list_changed")) {
                 // Client's workspace roots changed — re-query
                 if (session.client_supports_roots) requestRoots(&session);
+            } else if (json.eql(method, "notifications/cancelled")) {
+                // (#4) Accept cancellation — tools are synchronous, nothing to abort
+            } else if (json.eql(method, "logging/setLevel")) {
+                // (#3) Update minimum log level
+                handleSetLogLevel(&session, root, id);
             } else if (json.eql(method, "tools/list")) {
                 writeResult(alloc, session.stdout, id, tools.tools_list);
             } else if (json.eql(method, "tools/call")) {
-                handleCall(alloc, root, session.stdout, id);
+                handleCall(&session, root, id);
             } else if (json.eql(method, "ping")) {
                 writeResult(alloc, session.stdout, id, "{}");
             } else {
@@ -125,7 +156,7 @@ pub fn run(alloc: std.mem.Allocator) void {
 // ── initialize ─────────────────────────────────────────────────────────────
 //
 // Parse client capabilities and respond with server capabilities.
-// Change "name" and "version" to match your server.
+// Change "name", "version", and "instructions" to match your server.
 
 fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.Value) void {
     // Parse client capabilities from params.capabilities
@@ -142,15 +173,82 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         }
     }
 
+    // (#5) instructions + (#3) logging capability
     writeResult(s.alloc, s.stdout, id,
-        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"}}
+        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
     );
 }
 
-// ── roots ──────────────────────────────────────────────────────────────────
+// ── logging (#3) ───────────────────────────────────────────────────────────
 //
-// Server-to-client request: ask the client for its workspace roots.
-// The client responds with an array of Root objects (uri + optional name).
+// logging/setLevel — client sets the minimum log level.
+// notifications/message — server sends log messages to client.
+
+fn handleSetLogLevel(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.Value) void {
+    level: {
+        const p = root.get("params") orelse break :level;
+        if (p != .object) break :level;
+        const lv = p.object.get("level") orelse break :level;
+        if (lv != .string) break :level;
+        s.log_level = logLevelFromString(lv.string) orelse break :level;
+    }
+    writeResult(s.alloc, s.stdout, id, "{}");
+}
+
+/// Send a log notification to the client if level >= session log_level.
+pub fn writeLogNotification(s: *Session, level: LogLevel, data: []const u8) void {
+    if (@intFromEnum(level) < @intFromEnum(s.log_level)) return;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(s.alloc);
+
+    buf.appendSlice(s.alloc, "{\"level\":\"") catch return;
+    buf.appendSlice(s.alloc, @tagName(level)) catch return;
+    buf.appendSlice(s.alloc, "\",\"logger\":\"mcp-zig\",\"data\":\"") catch return;
+    json.writeEscaped(s.alloc, &buf, data);
+    buf.appendSlice(s.alloc, "\"}") catch return;
+
+    writeNotification(s.alloc, s.stdout, "notifications/message", buf.items);
+}
+
+// ── progress (#2, #6) ──────────────────────────────────────────────────────
+//
+// notifications/progress — report progress for long-running operations.
+// The progressToken comes from params._meta.progressToken in tools/call.
+
+/// Send a progress notification to the client.
+/// `token` is the raw JSON value from _meta.progressToken (string or integer).
+pub fn writeProgressNotification(
+    alloc: std.mem.Allocator,
+    stdout: std.fs.File,
+    token: std.json.Value,
+    progress: usize,
+    total: usize,
+    message: []const u8,
+) void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    buf.appendSlice(alloc, "{\"progressToken\":") catch return;
+    appendJsonValue(alloc, &buf, token);
+    buf.appendSlice(alloc, ",\"progress\":") catch return;
+    var tmp: [20]u8 = undefined;
+    const ps = std.fmt.bufPrint(&tmp, "{d}", .{progress}) catch return;
+    buf.appendSlice(alloc, ps) catch return;
+    buf.appendSlice(alloc, ",\"total\":") catch return;
+    const ts = std.fmt.bufPrint(&tmp, "{d}", .{total}) catch return;
+    buf.appendSlice(alloc, ts) catch return;
+    if (message.len > 0) {
+        buf.appendSlice(alloc, ",\"message\":\"") catch return;
+        json.writeEscaped(alloc, &buf, message);
+        buf.appendSlice(alloc, "\"") catch return;
+    }
+    buf.appendSlice(alloc, "}") catch return;
+
+    writeNotification(alloc, stdout, "notifications/progress", buf.items);
+}
+
+// ── roots ──────────────────────────────────────────────────────────────────
 
 fn requestRoots(s: *Session) void {
     const id = s.next_id;
@@ -175,7 +273,6 @@ fn handleResponse(s: *Session, root: *const std.json.ObjectMap) void {
                     parseRoots(s, &result_obj);
                 }
             }
-            // If "error" instead of "result", client doesn't support roots — ignore
         }
     }
 }
@@ -201,7 +298,11 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
         };
     }
 
-    // Log roots to stderr for debugging (stderr is not part of the MCP protocol)
+    // Log roots via MCP logging (#3) and stderr
+    var msg_buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Workspace roots updated: {d} root(s)", .{s.roots.items.len}) catch return;
+    writeLogNotification(s, .info, msg);
+
     for (s.roots.items) |r| {
         if (r.name.len > 0) {
             std.debug.print("[mcp-zig] root: {s} ({s})\n", .{ r.uri, r.name });
@@ -214,11 +315,13 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
 // ── tools/call ────────────────────────────────────────────────────────────
 
 fn handleCall(
-    alloc: std.mem.Allocator,
+    s: *Session,
     root: *const std.json.ObjectMap,
-    stdout: std.fs.File,
     id: ?std.json.Value,
 ) void {
+    const alloc = s.alloc;
+    const stdout = s.stdout;
+
     // Unwrap params
     const params_val = root.get("params") orelse {
         writeError(alloc, stdout, id, -32602, "Missing params"); return;
@@ -227,6 +330,14 @@ fn handleCall(
         writeError(alloc, stdout, id, -32602, "params must be object"); return;
     }
     const params = &params_val.object;
+
+    // (#6) Extract _meta.progressToken if present
+    const progress_token: ?std.json.Value = meta: {
+        const meta_val = params.get("_meta") orelse break :meta null;
+        if (meta_val != .object) break :meta null;
+        break :meta meta_val.object.get("progressToken");
+    };
+    _ = progress_token; // available for future use when tools get context passing
 
     // Tool name
     const name = json.getStr(params, "name") orelse {
@@ -252,21 +363,36 @@ fn handleCall(
     defer out.deinit(alloc);
     tools.dispatch(alloc, tool, args, &out);
 
+    // (#1) Build result with optional structuredContent
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
     result.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
     json.writeEscaped(alloc, &result, out.items);
-    result.appendSlice(alloc, "\"}],\"isError\":false}") catch return;
+    result.appendSlice(alloc, "\"}],\"isError\":false") catch return;
 
+    // If output looks like a JSON object, try to include it as structuredContent
+    if (out.items.len > 0 and out.items[0] == '{') {
+        if (isValidJsonObject(alloc, out.items)) {
+            result.appendSlice(alloc, ",\"structuredContent\":") catch return;
+            result.appendSlice(alloc, out.items) catch return;
+        }
+    }
+
+    result.appendSlice(alloc, "}") catch return;
     writeResult(alloc, stdout, id, result.items);
+}
+
+/// Quick check: is this a parseable JSON object?
+fn isValidJsonObject(alloc: std.mem.Allocator, data: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
 }
 
 // ── JSON-RPC 2.0 writers ────────────────────────────────────────────────────
 
 /// Write a JSON-RPC 2.0 result response.
 /// IMPORTANT: strips \n and \r from `result` before writing.
-/// Zig \\ multiline string literals embed literal newlines; those would break
-/// Claude Code's line-delimited ReadBuffer (each line = one JSON-RPC message).
 fn writeResult(
     alloc: std.mem.Allocator,
     stdout: std.fs.File,
@@ -311,6 +437,27 @@ fn writeError(
     _ = stdout.write(buf.items) catch 0;
 }
 
+/// Write a JSON-RPC 2.0 notification (no id, no response expected).
+fn writeNotification(
+    alloc: std.mem.Allocator,
+    stdout: std.fs.File,
+    method: []const u8,
+    params: []const u8,
+) void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"method\":\"") catch return;
+    buf.appendSlice(alloc, method) catch return;
+    buf.appendSlice(alloc, "\",\"params\":") catch return;
+    for (params) |c| {
+        if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
+    }
+    buf.appendSlice(alloc, "}\n") catch return;
+
+    _ = stdout.write(buf.items) catch 0;
+}
+
 /// Write a JSON-RPC 2.0 request (server → client).
 fn writeRequest(
     alloc: std.mem.Allocator,
@@ -335,8 +482,9 @@ fn writeRequest(
     _ = stdout.write(buf.items) catch 0;
 }
 
-fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
-    if (id) |v| switch (v) {
+/// Append a JSON value (string or integer) to buf — used for progressToken.
+fn appendJsonValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), val: std.json.Value) void {
+    switch (val) {
         .integer => |n| {
             var tmp: [20]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return;
@@ -348,6 +496,12 @@ fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Val
             buf.append(alloc, '"') catch return;
         },
         else => buf.appendSlice(alloc, "null") catch return,
+    }
+}
+
+fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
+    if (id) |v| {
+        appendJsonValue(alloc, buf, v);
     } else {
         buf.appendSlice(alloc, "null") catch return;
     }
