@@ -57,6 +57,82 @@ pub fn dispatch(
     }
 }
 
+/// Fast dispatch using raw JSON arguments (no std.json tree needed).
+/// Extracts fields directly from the raw JSON string with zero allocations.
+pub fn dispatchFast(
+    alloc: std.mem.Allocator,
+    tool: Tool,
+    args_raw: []const u8,
+    out: *std.ArrayList(u8),
+) void {
+    switch (tool) {
+        .read_file => handleReadFileFast(alloc, args_raw, out),
+        .list_dir  => handleListDirFast(alloc, args_raw, out),
+    }
+}
+
+fn handleReadFileFast(alloc: std.mem.Allocator, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+    const path = json.scanStr(args_raw, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    const max_bytes: usize = if (json.scanInt(args_raw, "max_bytes")) |n|
+        @intCast(@max(1, n))
+    else
+        DEFAULT_MAX_BYTES;
+
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        var tmp: [512]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
+        out.appendSlice(alloc, s) catch {};
+        return;
+    };
+    defer file.close();
+
+    out.ensureTotalCapacity(alloc, max_bytes) catch {
+        out.appendSlice(alloc, "error: out of memory") catch {};
+        return;
+    };
+    while (out.items.len < max_bytes) {
+        const buf = out.unusedCapacitySlice();
+        if (buf.len == 0) break;
+        const n = file.read(buf) catch |err| {
+            var tmp: [512]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
+            out.clearRetainingCapacity();
+            out.appendSlice(alloc, s) catch {};
+            return;
+        };
+        if (n == 0) break;
+        out.items.len += n;
+    }
+}
+
+fn handleListDirFast(alloc: std.mem.Allocator, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+    const path = json.scanStr(args_raw, "path") orelse ".";
+
+    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+        var tmp: [512]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
+        out.appendSlice(alloc, s) catch {};
+        return;
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        const kind: u8 = switch (entry.kind) {
+            .directory => 'd',
+            .file      => 'f',
+            .sym_link  => 'l',
+            else       => '?',
+        };
+        var line: [std.fs.max_path_bytes + 4]u8 = undefined;
+        const s = std.fmt.bufPrint(&line, "{c} {s}\n", .{ kind, entry.name }) catch continue;
+        out.appendSlice(alloc, s) catch {};
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_BYTES = 1024 * 1024; // 1 MB

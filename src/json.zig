@@ -44,9 +44,11 @@ pub fn readLineInto(alloc: std.mem.Allocator, reader: *std.Io.Reader, buf: *std.
 // ── Fast JSON-RPC field scanner ──────────────────────────────────────────────
 
 /// Result of scanning a JSON-RPC message for method and id without full parse.
+/// Result of scanning a JSON-RPC message for method and id without full parse.
 pub const ScanResult = struct {
     method: ?[]const u8 = null, // points into the source JSON
     id_raw: ?[]const u8 = null, // raw JSON fragment for id (e.g. "1" or "\"abc\"")
+    params_raw: ?[]const u8 = null, // raw JSON of the params object (for tools/call fast path)
     has_result: bool = false,
     has_error: bool = false,
 };
@@ -117,6 +119,11 @@ pub fn scanJsonRpc(data: []const u8) ScanResult {
         } else if (eql(key, "error")) {
             result.has_error = true;
             skipJsonValue(data, &i);
+        } else if (eql(key, "params")) {
+            // Capture the raw params object as a slice
+            const val_start = i;
+            skipJsonValue(data, &i);
+            result.params_raw = data[val_start..i];
         } else {
             // Skip unknown value
             skipJsonValue(data, &i);
@@ -175,6 +182,109 @@ fn skipJsonValue(data: []const u8, i: *usize) void {
             while (i.* < data.len and data[i.*] != ',' and data[i.*] != '}' and data[i.*] != ']') : (i.* += 1) {}
         },
     }
+}
+
+// ── Raw JSON field extractors (zero-alloc) ───────────────────────────────────
+//
+// Extract values from a raw JSON object string without building a tree.
+// Used by the tools/call fast path to avoid std.json.parseFromSlice entirely.
+
+/// Extract a string value for `key` from a raw JSON object. Returns a slice into `data`.
+pub fn scanStr(data: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(k, key)) {
+            if (data[i] != '"') return null;
+            i += 1;
+            const vs = i;
+            while (i < data.len and data[i] != '"') : (i += 1) {
+                if (data[i] == '\\') i += 1;
+            }
+            if (i < data.len) return data[vs..i];
+            return null;
+        }
+        skipJsonValue(data, &i);
+    }
+    return null;
+}
+
+/// Extract an integer value for `key` from a raw JSON object.
+pub fn scanInt(data: []const u8, key: []const u8) ?i64 {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(k, key)) {
+            const vs = i;
+            while (i < data.len and data[i] != ',' and data[i] != '}') : (i += 1) {}
+            const raw = std.mem.trim(u8, data[vs..i], " \t");
+            return std.fmt.parseInt(i64, raw, 10) catch null;
+        }
+        skipJsonValue(data, &i);
+    }
+    return null;
+}
+
+/// Extract a raw JSON object value for `key` from a raw JSON object.
+/// Returns the full `{...}` slice including braces.
+pub fn scanObj(data: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(k, key)) {
+            if (data[i] != '{') return null;
+            const vs = i;
+            skipJsonValue(data, &i);
+            return data[vs..i];
+        }
+        skipJsonValue(data, &i);
+    }
+    return null;
 }
 
 /// Legacy API — reads one byte at a time from the raw file handle.

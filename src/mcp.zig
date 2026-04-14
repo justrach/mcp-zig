@@ -122,14 +122,11 @@ pub fn run(alloc: std.mem.Allocator) void {
     });
 
     while (true) {
-        // Read line into reusable buffer (no allocation after first iteration)
         const line = json.readLineInto(alloc, &stdin_reader.interface, &session.line_buf) orelse break;
 
         const input = std.mem.trim(u8, line, " \t\r");
         if (input.len == 0) continue;
 
-        // Fast scan: extract method + id without building a JSON tree.
-        // For ping, tools/list, and notifications this is all we need — zero allocs.
         const scan = json.scanJsonRpc(input);
 
         if (scan.method) |method| {
@@ -141,34 +138,32 @@ pub fn run(alloc: std.mem.Allocator) void {
                 .notif_roots_changed => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_cancelled => {},
 
-                // Slow path: needs params — full JSON parse
-                .initialize, .logging_setLevel, .tools_call => {
+                // tools/call: scanner-based fast path (no std.json parse)
+                .tools_call => handleCall(&session, &scan),
+
+                // initialize + logging/setLevel: need full parse for complex params
+                .initialize, .logging_setLevel => {
                     const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
                         writeErrorRaw(&session, scan.id_raw, -32700, "Parse error");
                         continue;
                     };
                     defer parsed.deinit();
-
                     if (parsed.value != .object) {
                         writeErrorRaw(&session, scan.id_raw, -32600, "Invalid Request");
                         continue;
                     }
                     const root = &parsed.value.object;
                     const id = root.get("id");
-
                     switch (m) {
                         .initialize => handleInitialize(&session, root, id),
                         .logging_setLevel => handleSetLogLevel(&session, root, id),
-                        .tools_call => handleCall(&session, root, id),
                         else => unreachable,
                     }
                 },
             } else {
-                // Unknown method — error if it has an id (request), ignore if notification
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
             }
         } else if (scan.has_result or scan.has_error) {
-            // Response to a server-initiated request — needs full parse
             const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch continue;
             defer parsed.deinit();
             if (parsed.value == .object) {
@@ -179,6 +174,55 @@ pub fn run(alloc: std.mem.Allocator) void {
             writeErrorRaw(&session, null, -32600, "Missing method");
         }
     }
+}
+
+fn handleCall(
+    s: *Session,
+    scan: *const json.ScanResult,
+) void {
+    const alloc = s.alloc;
+    const id_raw = scan.id_raw;
+
+    // Extract tool name and arguments from raw params using scanner (no JSON tree parse)
+    const params_raw = scan.params_raw orelse {
+        writeErrorRaw(s, id_raw, -32602, "Missing params"); return;
+    };
+    const name = json.scanStr(params_raw, "name") orelse {
+        writeErrorRaw(s, id_raw, -32602, "Missing tool name"); return;
+    };
+    const args_raw = json.scanObj(params_raw, "arguments") orelse {
+        writeErrorRaw(s, id_raw, -32602, "Missing arguments"); return;
+    };
+
+    // Dispatch
+    const tool = tools.parse(name) orelse {
+        writeErrorRaw(s, id_raw, -32602, "Unknown tool"); return;
+    };
+
+    // Run handler into reusable tool_buf (clear, not free)
+    s.tool_buf.clearRetainingCapacity();
+    tools.dispatchFast(alloc, tool, args_raw, &s.tool_buf);
+
+    // Build the complete JSON-RPC response directly into write_buf.
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 120 + s.tool_buf.items.len * 2) catch {};
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
+    json.writeEscaped(alloc, buf, s.tool_buf.items);
+    buf.appendSlice(alloc, "\"}],\"isError\":false") catch return;
+
+    // If output looks like a JSON object, include as structuredContent
+    if (s.tool_buf.items.len > 0 and s.tool_buf.items[0] == '{') {
+        if (isValidJsonObject(s.tool_buf.items)) {
+            buf.appendSlice(alloc, ",\"structuredContent\":") catch return;
+            buf.appendSlice(alloc, s.tool_buf.items) catch return;
+        }
+    }
+
+    buf.appendSlice(alloc, "}}\n") catch return;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -338,79 +382,6 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
     }
 }
 
-// ── tools/call ────────────────────────────────────────────────────────────
-
-fn handleCall(
-    s: *Session,
-    root: *const std.json.ObjectMap,
-    id: ?std.json.Value,
-) void {
-    const alloc = s.alloc;
-
-    // Unwrap params
-    const params_val = root.get("params") orelse {
-        writeError(s, id, -32602, "Missing params"); return;
-    };
-    if (params_val != .object) {
-        writeError(s, id, -32602, "params must be object"); return;
-    }
-    const params = &params_val.object;
-
-    // (#6) Extract _meta.progressToken if present
-    const progress_token: ?std.json.Value = meta: {
-        const meta_val = params.get("_meta") orelse break :meta null;
-        if (meta_val != .object) break :meta null;
-        break :meta meta_val.object.get("progressToken");
-    };
-    _ = progress_token; // available for future use when tools get context passing
-
-    // Tool name
-    const name = json.getStr(params, "name") orelse {
-        writeError(s, id, -32602, "Missing tool name"); return;
-    };
-
-    // Arguments
-    const args_val = params.get("arguments") orelse {
-        writeError(s, id, -32602, "Missing arguments"); return;
-    };
-    if (args_val != .object) {
-        writeError(s, id, -32602, "arguments must be object"); return;
-    }
-    const args = &args_val.object;
-
-    // Dispatch
-    const tool = tools.parse(name) orelse {
-        writeError(s, id, -32602, "Unknown tool"); return;
-    };
-
-    // Run handler into reusable tool_buf (clear, not free)
-    s.tool_buf.clearRetainingCapacity();
-    tools.dispatch(alloc, tool, args, &s.tool_buf);
-
-    // Build the complete JSON-RPC response directly into write_buf.
-    // We write the full envelope here (not via writeResult) because the
-    // content envelope is built in-place and we can't pass a slice of
-    // write_buf to writeResult (which also uses write_buf).
-    const buf = &s.write_buf;
-    buf.clearRetainingCapacity();
-    buf.ensureTotalCapacity(alloc, 120 + s.tool_buf.items.len * 2) catch {};
-    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
-    appendId(alloc, buf, id);
-    buf.appendSlice(alloc, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
-    json.writeEscaped(alloc, buf, s.tool_buf.items);
-    buf.appendSlice(alloc, "\"}],\"isError\":false") catch return;
-
-    // If output looks like a JSON object, include as structuredContent
-    if (s.tool_buf.items.len > 0 and s.tool_buf.items[0] == '{') {
-        if (isValidJsonObject(s.tool_buf.items)) {
-            buf.appendSlice(alloc, ",\"structuredContent\":") catch return;
-            buf.appendSlice(alloc, s.tool_buf.items) catch return;
-        }
-    }
-
-    buf.appendSlice(alloc, "}}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
-}
 
 /// Lightweight check for whether data looks like a complete JSON object.
 /// Lightweight check for whether data looks like a complete JSON object.
