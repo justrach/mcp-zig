@@ -228,16 +228,39 @@ pub fn eql(a: []const u8, b: []const u8) bool {
 
 /// Append `s` to `out` with JSON string escaping applied.
 /// Batch-copies runs of safe characters for performance.
+/// Append `s` to `out` with JSON string escaping applied.
+/// Uses SIMD (16-byte vectors) to scan for safe characters in bulk,
+/// then batch-copies safe runs. Falls back to scalar for the tail.
 pub fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
+    const Vec = @Vector(16, u8);
     var i: usize = 0;
+
     while (i < s.len) {
         const start = i;
+
+        // SIMD fast scan: check 16 bytes at a time for characters needing escape
+        while (i + 16 <= s.len) {
+            const chunk: Vec = s[i..][0..16].*;
+            // Characters needing escape: < 0x20, '"' (0x22), '\\' (0x5C)
+            const lo = chunk < @as(Vec, @splat(@as(u8, 0x20)));
+            const dq = chunk == @as(Vec, @splat(@as(u8, '"')));
+            const bs = chunk == @as(Vec, @splat(@as(u8, '\\')));
+            const need_esc = lo | dq | bs;
+            if (@reduce(.Or, need_esc)) break; // found a char needing escape
+            i += 16;
+        }
+
+        // Scalar scan for remaining bytes (< 16 or after SIMD found something)
         while (i < s.len) : (i += 1) {
             const c = s[i];
             if (c < 0x20 or c == '"' or c == '\\') break;
         }
+
+        // Batch-copy the safe run
         if (i > start) out.appendSlice(alloc, s[start..i]) catch return;
         if (i >= s.len) break;
+
+        // Escape the special character
         const c = s[i];
         switch (c) {
             '"' => out.appendSlice(alloc, "\\\"") catch return,

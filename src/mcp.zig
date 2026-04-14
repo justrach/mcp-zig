@@ -108,6 +108,19 @@ pub fn run(alloc: std.mem.Allocator) void {
     var read_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&read_buf);
 
+    // Comptime perfect-hash method dispatch table — O(1) lookup, no sequential string comparisons.
+    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled };
+    const method_map = std.StaticStringMap(Method).initComptime(.{
+        .{ "ping", .ping },
+        .{ "tools/list", .tools_list },
+        .{ "tools/call", .tools_call },
+        .{ "initialize", .initialize },
+        .{ "logging/setLevel", .logging_setLevel },
+        .{ "notifications/initialized", .notif_initialized },
+        .{ "notifications/roots/list_changed", .notif_roots_changed },
+        .{ "notifications/cancelled", .notif_cancelled },
+    });
+
     while (true) {
         // Read line into reusable buffer (no allocation after first iteration)
         const line = json.readLineInto(alloc, &stdin_reader.interface, &session.line_buf) orelse break;
@@ -120,42 +133,39 @@ pub fn run(alloc: std.mem.Allocator) void {
         const scan = json.scanJsonRpc(input);
 
         if (scan.method) |method| {
-            if (json.eql(method, "ping")) {
-                // Fast path: no parse needed
-                writeResultRaw(&session, scan.id_raw, "{}");
-            } else if (json.eql(method, "tools/list")) {
-                // Fast path: no parse needed
-                writeResultRaw(&session, scan.id_raw, tools.tools_list);
-            } else if (json.eql(method, "notifications/initialized")) {
-                if (session.client_supports_roots) requestRoots(&session);
-            } else if (json.eql(method, "notifications/roots/list_changed")) {
-                if (session.client_supports_roots) requestRoots(&session);
-            } else if (json.eql(method, "notifications/cancelled")) {
-                // Accept cancellation — tools are synchronous, nothing to abort
+            if (method_map.get(method)) |m| switch (m) {
+                // Fast path: no JSON parse needed — zero allocations
+                .ping => writeResultRaw(&session, scan.id_raw, "{}"),
+                .tools_list => writeResultRaw(&session, scan.id_raw, tools.tools_list),
+                .notif_initialized => { if (session.client_supports_roots) requestRoots(&session); },
+                .notif_roots_changed => { if (session.client_supports_roots) requestRoots(&session); },
+                .notif_cancelled => {},
+
+                // Slow path: needs params — full JSON parse
+                .initialize, .logging_setLevel, .tools_call => {
+                    const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
+                        writeErrorRaw(&session, scan.id_raw, -32700, "Parse error");
+                        continue;
+                    };
+                    defer parsed.deinit();
+
+                    if (parsed.value != .object) {
+                        writeErrorRaw(&session, scan.id_raw, -32600, "Invalid Request");
+                        continue;
+                    }
+                    const root = &parsed.value.object;
+                    const id = root.get("id");
+
+                    switch (m) {
+                        .initialize => handleInitialize(&session, root, id),
+                        .logging_setLevel => handleSetLogLevel(&session, root, id),
+                        .tools_call => handleCall(&session, root, id),
+                        else => unreachable,
+                    }
+                },
             } else {
-                // Slow path: methods that need params — do the full parse
-                const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-                    writeErrorRaw(&session, scan.id_raw, -32700, "Parse error");
-                    continue;
-                };
-                defer parsed.deinit();
-
-                if (parsed.value != .object) {
-                    writeErrorRaw(&session, scan.id_raw, -32600, "Invalid Request");
-                    continue;
-                }
-                const root = &parsed.value.object;
-                const id = root.get("id");
-
-                if (json.eql(method, "initialize")) {
-                    handleInitialize(&session, root, id);
-                } else if (json.eql(method, "logging/setLevel")) {
-                    handleSetLogLevel(&session, root, id);
-                } else if (json.eql(method, "tools/call")) {
-                    handleCall(&session, root, id);
-                } else {
-                    if (id != null) writeError(&session, id, -32601, "Method not found");
-                }
+                // Unknown method — error if it has an id (request), ignore if notification
+                if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
             }
         } else if (scan.has_result or scan.has_error) {
             // Response to a server-initiated request — needs full parse
