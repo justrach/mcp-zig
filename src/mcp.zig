@@ -96,10 +96,11 @@ pub fn run(alloc: std.mem.Allocator) void {
         .stdout = std.fs.File.stdout(),
     };
     defer session.deinit();
-    const stdin = std.fs.File.stdin();
+    var read_buf: [4096]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(&read_buf);
 
     while (true) {
-        const line = json.readLine(alloc, stdin) orelse break;
+        const line = json.readLineBuf(alloc, &stdin_reader.interface) orelse break;
         defer alloc.free(line);
 
         const input = std.mem.trim(u8, line, " \t\r");
