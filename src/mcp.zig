@@ -80,6 +80,7 @@ const Session = struct {
     // Avoids per-request alloc/free cycles in the hot path.
     write_buf: std.ArrayList(u8) = .empty,
     tool_buf: std.ArrayList(u8) = .empty,
+    line_buf: std.ArrayList(u8) = .empty,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -94,6 +95,7 @@ const Session = struct {
         self.roots.deinit(self.alloc);
         self.write_buf.deinit(self.alloc);
         self.tool_buf.deinit(self.alloc);
+        self.line_buf.deinit(self.alloc);
     }
 };
 
@@ -107,56 +109,64 @@ pub fn run(alloc: std.mem.Allocator) void {
     var stdin_reader = std.fs.File.stdin().reader(&read_buf);
 
     while (true) {
-        const line = json.readLineBuf(alloc, &stdin_reader.interface) orelse break;
-        defer alloc.free(line);
+        // Read line into reusable buffer (no allocation after first iteration)
+        const line = json.readLineInto(alloc, &stdin_reader.interface, &session.line_buf) orelse break;
 
         const input = std.mem.trim(u8, line, " \t\r");
         if (input.len == 0) continue;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-            writeError(&session, null, -32700, "Parse error");
-            continue;
-        };
-        defer parsed.deinit();
+        // Fast scan: extract method + id without building a JSON tree.
+        // For ping, tools/list, and notifications this is all we need — zero allocs.
+        const scan = json.scanJsonRpc(input);
 
-        if (parsed.value != .object) {
-            writeError(&session, null, -32600, "Invalid Request");
-            continue;
-        }
-
-        const root = &parsed.value.object;
-
-        // Dispatch: requests/notifications have "method", responses do not
-        if (json.getStr(root, "method")) |method| {
-            const id = root.get("id");
-
-            if (json.eql(method, "initialize")) {
-                handleInitialize(&session, root, id);
+        if (scan.method) |method| {
+            if (json.eql(method, "ping")) {
+                // Fast path: no parse needed
+                writeResultRaw(&session, scan.id_raw, "{}");
+            } else if (json.eql(method, "tools/list")) {
+                // Fast path: no parse needed
+                writeResultRaw(&session, scan.id_raw, tools.tools_list);
             } else if (json.eql(method, "notifications/initialized")) {
-                // Post-handshake: request workspace roots if client supports them
                 if (session.client_supports_roots) requestRoots(&session);
             } else if (json.eql(method, "notifications/roots/list_changed")) {
-                // Client's workspace roots changed — re-query
                 if (session.client_supports_roots) requestRoots(&session);
             } else if (json.eql(method, "notifications/cancelled")) {
-                // (#4) Accept cancellation — tools are synchronous, nothing to abort
-            } else if (json.eql(method, "logging/setLevel")) {
-                // (#3) Update minimum log level
-                handleSetLogLevel(&session, root, id);
-            } else if (json.eql(method, "tools/list")) {
-                writeResult(&session, id, tools.tools_list);
-            } else if (json.eql(method, "tools/call")) {
-                handleCall(&session, root, id);
-            } else if (json.eql(method, "ping")) {
-                writeResult(&session, id, "{}");
+                // Accept cancellation — tools are synchronous, nothing to abort
             } else {
-                if (id != null) writeError(&session, id, -32601, "Method not found");
+                // Slow path: methods that need params — do the full parse
+                const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
+                    writeErrorRaw(&session, scan.id_raw, -32700, "Parse error");
+                    continue;
+                };
+                defer parsed.deinit();
+
+                if (parsed.value != .object) {
+                    writeErrorRaw(&session, scan.id_raw, -32600, "Invalid Request");
+                    continue;
+                }
+                const root = &parsed.value.object;
+                const id = root.get("id");
+
+                if (json.eql(method, "initialize")) {
+                    handleInitialize(&session, root, id);
+                } else if (json.eql(method, "logging/setLevel")) {
+                    handleSetLogLevel(&session, root, id);
+                } else if (json.eql(method, "tools/call")) {
+                    handleCall(&session, root, id);
+                } else {
+                    if (id != null) writeError(&session, id, -32601, "Method not found");
+                }
             }
-        } else if (root.get("result") != null or root.get("error") != null) {
-            // Response to a server-initiated request
-            handleResponse(&session, root);
+        } else if (scan.has_result or scan.has_error) {
+            // Response to a server-initiated request — needs full parse
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var obj = parsed.value.object;
+                handleResponse(&session, &obj);
+            }
         } else {
-            writeError(&session, null, -32600, "Missing method");
+            writeErrorRaw(&session, null, -32600, "Missing method");
         }
     }
 }
@@ -426,6 +436,37 @@ fn isValidJsonObject(data: []const u8) bool {
 }
 
 // ── JSON-RPC 2.0 writers (reuse s.write_buf across calls) ────────────────────
+
+/// Write a result response using a raw id string (from scanner — avoids JSON parse).
+fn writeResultRaw(s: *Session, id_raw: ?[]const u8, result: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 40 + result.len) catch {};
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"result\":") catch return;
+    appendStrippingNewlines(alloc, buf, result);
+    buf.appendSlice(alloc, "}\n") catch return;
+    _ = s.stdout.write(buf.items) catch 0;
+}
+
+/// Write an error response using a raw id string (from scanner — avoids JSON parse).
+fn writeErrorRaw(s: *Session, id_raw: ?[]const u8, code: i32, msg: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"error\":{\"code\":") catch return;
+    var tmp: [12]u8 = undefined;
+    const cs = std.fmt.bufPrint(&tmp, "{d}", .{code}) catch return;
+    buf.appendSlice(alloc, cs) catch return;
+    buf.appendSlice(alloc, ",\"message\":\"") catch return;
+    json.writeEscaped(alloc, buf, msg);
+    buf.appendSlice(alloc, "\"}}\n") catch return;
+    _ = s.stdout.write(buf.items) catch 0;
+}
 
 /// Write a JSON-RPC 2.0 result response.
 fn writeResult(s: *Session, id: ?std.json.Value, result: []const u8) void {

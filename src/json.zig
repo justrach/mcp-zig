@@ -25,6 +25,158 @@ pub fn readLineBuf(alloc: std.mem.Allocator, reader: *std.Io.Reader) ?[]u8 {
     }
 }
 
+/// Read one newline-terminated line into an existing ArrayList (clear + refill).
+/// Avoids per-line allocation — the buffer grows once and is reused across calls.
+/// Returns the filled slice, or null on EOF/error.
+pub fn readLineInto(alloc: std.mem.Allocator, reader: *std.Io.Reader, buf: *std.ArrayList(u8)) ?[]u8 {
+    buf.clearRetainingCapacity();
+    while (true) {
+        const byte = reader.takeByte() catch {
+            if (buf.items.len == 0) return null;
+            return buf.items;
+        };
+        if (byte == '\n') return buf.items;
+        buf.append(alloc, byte) catch return null;
+        if (buf.items.len > MAX_LINE) return null;
+    }
+}
+
+// ── Fast JSON-RPC field scanner ──────────────────────────────────────────────
+
+/// Result of scanning a JSON-RPC message for method and id without full parse.
+pub const ScanResult = struct {
+    method: ?[]const u8 = null, // points into the source JSON
+    id_raw: ?[]const u8 = null, // raw JSON fragment for id (e.g. "1" or "\"abc\"")
+    has_result: bool = false,
+    has_error: bool = false,
+};
+
+/// Fast scan of a JSON-RPC message to extract "method" and "id" fields
+/// without building a JSON tree. Returns slices pointing into `data`.
+/// O(n) single pass, zero allocations.
+pub fn scanJsonRpc(data: []const u8) ScanResult {
+    var result: ScanResult = .{};
+    var i: usize = 0;
+
+    while (i < data.len) {
+        // Skip to next '"'
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1; // skip opening '"'
+
+        // Read the key
+        const key_start = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1; // skip escaped char
+        }
+        if (i >= data.len) break;
+        const key = data[key_start..i];
+        i += 1; // skip closing '"'
+
+        // Skip ':'
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1; // skip ':'
+
+        // Skip whitespace
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(key, "method")) {
+            // Value must be a string
+            if (data[i] == '"') {
+                i += 1;
+                const val_start = i;
+                while (i < data.len and data[i] != '"') : (i += 1) {
+                    if (data[i] == '\\') i += 1;
+                }
+                if (i < data.len) {
+                    result.method = data[val_start..i];
+                    i += 1;
+                }
+            }
+        } else if (eql(key, "id")) {
+            // Capture raw value: number, string, or null
+            const val_start = i;
+            if (data[i] == '"') {
+                // String id
+                i += 1;
+                while (i < data.len and data[i] != '"') : (i += 1) {
+                    if (data[i] == '\\') i += 1;
+                }
+                if (i < data.len) i += 1;
+            } else {
+                // Number or null — scan to next , or }
+                while (i < data.len and data[i] != ',' and data[i] != '}') : (i += 1) {}
+            }
+            result.id_raw = std.mem.trim(u8, data[val_start..i], " \t");
+        } else if (eql(key, "result")) {
+            result.has_result = true;
+            // Skip the value (we don't need it for dispatch)
+            skipJsonValue(data, &i);
+        } else if (eql(key, "error")) {
+            result.has_error = true;
+            skipJsonValue(data, &i);
+        } else {
+            // Skip unknown value
+            skipJsonValue(data, &i);
+        }
+    }
+    return result;
+}
+
+/// Skip one JSON value starting at data[i*]. Advances i past the value.
+fn skipJsonValue(data: []const u8, i: *usize) void {
+    if (i.* >= data.len) return;
+    switch (data[i.*]) {
+        '"' => {
+            i.* += 1;
+            while (i.* < data.len and data[i.*] != '"') : (i.* += 1) {
+                if (data[i.*] == '\\') i.* += 1;
+            }
+            if (i.* < data.len) i.* += 1;
+        },
+        '{' => {
+            var depth: usize = 1;
+            i.* += 1;
+            while (i.* < data.len and depth > 0) : (i.* += 1) {
+                switch (data[i.*]) {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    '"' => { // skip strings to avoid counting braces inside them
+                        i.* += 1;
+                        while (i.* < data.len and data[i.*] != '"') : (i.* += 1) {
+                            if (data[i.*] == '\\') i.* += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        '[' => {
+            var depth: usize = 1;
+            i.* += 1;
+            while (i.* < data.len and depth > 0) : (i.* += 1) {
+                switch (data[i.*]) {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    '"' => {
+                        i.* += 1;
+                        while (i.* < data.len and data[i.*] != '"') : (i.* += 1) {
+                            if (data[i.*] == '\\') i.* += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => {
+            // number, bool, null — scan to delimiter
+            while (i.* < data.len and data[i.*] != ',' and data[i.*] != '}' and data[i.*] != ']') : (i.* += 1) {}
+        },
+    }
+}
+
 /// Legacy API — reads one byte at a time from the raw file handle.
 /// Prefer readLineBuf with a File.Reader for better performance.
 pub fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
