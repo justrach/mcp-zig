@@ -141,25 +141,9 @@ pub fn run(alloc: std.mem.Allocator) void {
                 // tools/call: scanner-based fast path (no std.json parse)
                 .tools_call => handleCall(&session, &scan),
 
-                // initialize + logging/setLevel: need full parse for complex params
-                .initialize, .logging_setLevel => {
-                    const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-                        writeErrorRaw(&session, scan.id_raw, -32700, "Parse error");
-                        continue;
-                    };
-                    defer parsed.deinit();
-                    if (parsed.value != .object) {
-                        writeErrorRaw(&session, scan.id_raw, -32600, "Invalid Request");
-                        continue;
-                    }
-                    const root = &parsed.value.object;
-                    const id = root.get("id");
-                    switch (m) {
-                        .initialize => handleInitialize(&session, root, id),
-                        .logging_setLevel => handleSetLogLevel(&session, root, id),
-                        else => unreachable,
-                    }
-                },
+                // initialize + logging/setLevel: scanner-based (no std.json parse)
+                .initialize => handleInitializeFast(&session, &scan),
+                .logging_setLevel => handleSetLogLevelFast(&session, &scan),
             } else {
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
             }
@@ -251,20 +235,31 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
     );
 }
 
-// ── logging (#3) ───────────────────────────────────────────────────────────
-//
-// logging/setLevel — client sets the minimum log level.
-// notifications/message — server sends log messages to client.
-
-fn handleSetLogLevel(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.Value) void {
-    level: {
-        const p = root.get("params") orelse break :level;
-        if (p != .object) break :level;
-        const lv = p.object.get("level") orelse break :level;
-        if (lv != .string) break :level;
-        s.log_level = logLevelFromString(lv.string) orelse break :level;
+/// Scanner-based initialize — no std.json parse needed.
+fn handleInitializeFast(s: *Session, scan: *const json.ScanResult) void {
+    if (scan.params_raw) |params_raw| {
+        if (json.scanObj(params_raw, "capabilities")) |caps| {
+            if (json.scanObj(caps, "roots")) |roots| {
+                s.client_supports_roots = true;
+                s.client_roots_list_changed = json.scanBool(roots, "listChanged");
+            }
+        }
     }
-    writeResult(s, id, "{}");
+    writeResultRaw(s, scan.id_raw,
+        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
+    );
+}
+
+// ── logging (#3) ───────────────────────────────────────────────────────────
+
+/// Scanner-based setLevel — no std.json parse needed.
+fn handleSetLogLevelFast(s: *Session, scan: *const json.ScanResult) void {
+    if (scan.params_raw) |params_raw| {
+        if (json.scanStr(params_raw, "level")) |level_str| {
+            s.log_level = logLevelFromString(level_str) orelse s.log_level;
+        }
+    }
+    writeResultRaw(s, scan.id_raw, "{}");
 }
 
 /// Send a log notification to the client if level >= session log_level.

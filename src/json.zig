@@ -287,6 +287,59 @@ pub fn scanObj(data: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Extract a boolean value for `key` from a raw JSON object.
+pub fn scanBool(data: []const u8, key: []const u8) bool {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(k, key)) {
+            if (i + 4 <= data.len and std.mem.eql(u8, data[i..][0..4], "true")) return true;
+            return false;
+        }
+        skipJsonValue(data, &i);
+    }
+    return false;
+}
+
+/// Check if a key exists in a raw JSON object (value can be anything).
+pub fn scanHasKey(data: []const u8, key: []const u8) bool {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+
+        if (eql(k, key)) return true;
+        skipJsonValue(data, &i);
+    }
+    return false;
+}
+
 /// Legacy API — reads one byte at a time from the raw file handle.
 /// Prefer readLineBuf with a File.Reader for better performance.
 pub fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
