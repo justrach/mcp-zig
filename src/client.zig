@@ -21,6 +21,10 @@ pub const McpClient = struct {
     alloc: std.mem.Allocator,
     process: std.process.Child,
     next_id: i64,
+    // Buffered reading state — avoids per-byte syscalls in readOneLine
+    stdout_buf: [4096]u8 = undefined,
+    stdout_pos: usize = 0,
+    stdout_len: usize = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -81,6 +85,8 @@ pub const McpClient = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.alloc);
 
+        // Pre-allocate: base template ~70 + name + args + id + margin
+        buf.ensureTotalCapacity(self.alloc, 80 + name.len + args_json.len) catch {};
         buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return error.OutOfMemory;
         var id_buf: [20]u8 = undefined;
         const id = self.next_id;
@@ -111,25 +117,22 @@ pub const McpClient = struct {
     // ── Low-level helpers ────────────────────────────────────────────────────
 
     fn sendAndReceive(self: *McpClient, template: []const u8) ![]u8 {
-        // Replace __ID__ with actual ID
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.alloc);
-
+        // Replace __ID__ with actual ID using indexOf for O(1) find
         const id = self.next_id;
         self.next_id += 1;
         var id_buf: [20]u8 = undefined;
         const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return error.OutOfMemory;
 
-        // Find and replace __ID__
-        var i: usize = 0;
-        while (i < template.len) {
-            if (i + 6 <= template.len and std.mem.eql(u8, template[i .. i + 6], "__ID__")) {
-                buf.appendSlice(self.alloc, id_str) catch return error.OutOfMemory;
-                i += 6;
-            } else {
-                buf.append(self.alloc, template[i]) catch return error.OutOfMemory;
-                i += 1;
-            }
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        buf.ensureTotalCapacity(self.alloc, template.len + id_str.len) catch {};
+
+        if (std.mem.indexOf(u8, template, "__ID__")) |pos| {
+            buf.appendSlice(self.alloc, template[0..pos]) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, id_str) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, template[pos + 6 ..]) catch return error.OutOfMemory;
+        } else {
+            buf.appendSlice(self.alloc, template) catch return error.OutOfMemory;
         }
         buf.append(self.alloc, '\n') catch return error.OutOfMemory;
 
@@ -158,22 +161,47 @@ pub const McpClient = struct {
     }
 
     /// Read exactly one newline-terminated line from the server's stdout.
+    /// Uses internal 4KB buffer to batch syscalls — typically 1 read per response
+    /// instead of 1 read per byte.
     fn readOneLine(self: *McpClient) ![]u8 {
         const stdout = self.process.stdout orelse return error.StdoutClosed;
 
         var line: std.ArrayList(u8) = .empty;
-        var byte_buf: [1]u8 = undefined;
         while (true) {
-            const n = try stdout.read(&byte_buf);
-            if (n == 0) {
-                line.deinit(self.alloc);
-                return error.ServerClosed;
+            // Refill buffer if exhausted
+            if (self.stdout_pos >= self.stdout_len) {
+                const n = try stdout.read(&self.stdout_buf);
+                if (n == 0) {
+                    if (line.items.len > 0) {
+                        return line.toOwnedSlice(self.alloc) catch {
+                            line.deinit(self.alloc);
+                            return error.OutOfMemory;
+                        };
+                    }
+                    line.deinit(self.alloc);
+                    return error.ServerClosed;
+                }
+                self.stdout_pos = 0;
+                self.stdout_len = n;
             }
-            if (byte_buf[0] == '\n') break;
-            line.append(self.alloc, byte_buf[0]) catch {
-                line.deinit(self.alloc);
-                return error.OutOfMemory;
-            };
+
+            // Scan for newline in buffered data
+            const remaining = self.stdout_buf[self.stdout_pos..self.stdout_len];
+            if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
+                line.appendSlice(self.alloc, remaining[0..nl_pos]) catch {
+                    line.deinit(self.alloc);
+                    return error.OutOfMemory;
+                };
+                self.stdout_pos += nl_pos + 1;
+                break;
+            } else {
+                line.appendSlice(self.alloc, remaining) catch {
+                    line.deinit(self.alloc);
+                    return error.OutOfMemory;
+                };
+                self.stdout_pos = self.stdout_len;
+            }
+
             if (line.items.len > json.MAX_LINE) {
                 line.deinit(self.alloc);
                 return error.ResponseTooLarge;

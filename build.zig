@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target   = target,
             .optimize = optimize,
+            .single_threaded = true, // no TLS setup overhead
+            .strip = true,           // smaller binary, faster page-in
         }),
     });
     b.installArtifact(exe);

@@ -14,7 +14,8 @@ const std = @import("std");
 const mcp = @import("mcp.zig");
 
 pub fn main() void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    mcp.run(gpa.allocator());
+    // Arena over page_allocator: one mmap up front, then O(1) bump allocation.
+    // No per-allocation syscalls, no free overhead — ideal for a short-lived process.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    mcp.run(arena.allocator());
 }

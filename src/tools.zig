@@ -83,15 +83,26 @@ fn handleReadFile(
     };
     defer file.close();
 
-    const content = file.readToEndAlloc(alloc, max_bytes) catch |err| {
-        var tmp: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
-        out.appendSlice(alloc, s) catch {};
+    // Read directly into the output buffer to avoid a temporary allocation + copy.
+    // Reserve space up front, then read into the unused tail of the ArrayList.
+    out.ensureTotalCapacity(alloc, max_bytes) catch {
+        out.appendSlice(alloc, "error: out of memory") catch {};
         return;
     };
-    defer alloc.free(content);
-
-    out.appendSlice(alloc, content) catch {};
+    while (out.items.len < max_bytes) {
+        const buf = out.unusedCapacitySlice();
+        if (buf.len == 0) break;
+        const n = file.read(buf) catch |err| {
+            var tmp: [512]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
+            // Reset output, write error instead
+            out.clearRetainingCapacity();
+            out.appendSlice(alloc, s) catch {};
+            return;
+        };
+        if (n == 0) break;
+        out.items.len += n;
+    }
 }
 
 fn handleListDir(

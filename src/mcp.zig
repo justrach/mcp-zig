@@ -76,6 +76,11 @@ const Session = struct {
     // Logging (#3)
     log_level: LogLevel = .warning,
 
+    // Reusable buffers — allocated once, cleared between requests (Rust BytesMut pattern).
+    // Avoids per-request alloc/free cycles in the hot path.
+    write_buf: std.ArrayList(u8) = .empty,
+    tool_buf: std.ArrayList(u8) = .empty,
+
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
             self.alloc.free(r.uri);
@@ -87,6 +92,8 @@ const Session = struct {
     fn deinit(self: *Session) void {
         self.freeRoots();
         self.roots.deinit(self.alloc);
+        self.write_buf.deinit(self.alloc);
+        self.tool_buf.deinit(self.alloc);
     }
 };
 
@@ -107,13 +114,13 @@ pub fn run(alloc: std.mem.Allocator) void {
         if (input.len == 0) continue;
 
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
-            writeError(alloc, session.stdout, null, -32700, "Parse error");
+            writeError(&session, null, -32700, "Parse error");
             continue;
         };
         defer parsed.deinit();
 
         if (parsed.value != .object) {
-            writeError(alloc, session.stdout, null, -32600, "Invalid Request");
+            writeError(&session, null, -32600, "Invalid Request");
             continue;
         }
 
@@ -137,19 +144,19 @@ pub fn run(alloc: std.mem.Allocator) void {
                 // (#3) Update minimum log level
                 handleSetLogLevel(&session, root, id);
             } else if (json.eql(method, "tools/list")) {
-                writeResult(alloc, session.stdout, id, tools.tools_list);
+                writeResult(&session, id, tools.tools_list);
             } else if (json.eql(method, "tools/call")) {
                 handleCall(&session, root, id);
             } else if (json.eql(method, "ping")) {
-                writeResult(alloc, session.stdout, id, "{}");
+                writeResult(&session, id, "{}");
             } else {
-                if (id != null) writeError(alloc, session.stdout, id, -32601, "Method not found");
+                if (id != null) writeError(&session, id, -32601, "Method not found");
             }
         } else if (root.get("result") != null or root.get("error") != null) {
             // Response to a server-initiated request
             handleResponse(&session, root);
         } else {
-            writeError(alloc, session.stdout, null, -32600, "Missing method");
+            writeError(&session, null, -32600, "Missing method");
         }
     }
 }
@@ -175,7 +182,7 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
     }
 
     // (#5) instructions + (#3) logging capability
-    writeResult(s.alloc, s.stdout, id,
+    writeResult(s, id,
         \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
     );
 }
@@ -193,23 +200,23 @@ fn handleSetLogLevel(s: *Session, root: *const std.json.ObjectMap, id: ?std.json
         if (lv != .string) break :level;
         s.log_level = logLevelFromString(lv.string) orelse break :level;
     }
-    writeResult(s.alloc, s.stdout, id, "{}");
+    writeResult(s, id, "{}");
 }
 
 /// Send a log notification to the client if level >= session log_level.
 pub fn writeLogNotification(s: *Session, level: LogLevel, data: []const u8) void {
     if (@intFromEnum(level) < @intFromEnum(s.log_level)) return;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(s.alloc);
+    const alloc = s.alloc;
+    // Reuse tool_buf for building the notification params (write_buf is used by writeNotification)
+    s.tool_buf.clearRetainingCapacity();
+    s.tool_buf.appendSlice(alloc, "{\"level\":\"") catch return;
+    s.tool_buf.appendSlice(alloc, @tagName(level)) catch return;
+    s.tool_buf.appendSlice(alloc, "\",\"logger\":\"mcp-zig\",\"data\":\"") catch return;
+    json.writeEscaped(alloc, &s.tool_buf, data);
+    s.tool_buf.appendSlice(alloc, "\"}") catch return;
 
-    buf.appendSlice(s.alloc, "{\"level\":\"") catch return;
-    buf.appendSlice(s.alloc, @tagName(level)) catch return;
-    buf.appendSlice(s.alloc, "\",\"logger\":\"mcp-zig\",\"data\":\"") catch return;
-    json.writeEscaped(s.alloc, &buf, data);
-    buf.appendSlice(s.alloc, "\"}") catch return;
-
-    writeNotification(s.alloc, s.stdout, "notifications/message", buf.items);
+    writeNotification(s, "notifications/message", s.tool_buf.items);
 }
 
 // ── progress (#2, #6) ──────────────────────────────────────────────────────
@@ -220,33 +227,31 @@ pub fn writeLogNotification(s: *Session, level: LogLevel, data: []const u8) void
 /// Send a progress notification to the client.
 /// `token` is the raw JSON value from _meta.progressToken (string or integer).
 pub fn writeProgressNotification(
-    alloc: std.mem.Allocator,
-    stdout: std.fs.File,
+    s: *Session,
     token: std.json.Value,
     progress: usize,
     total: usize,
     message: []const u8,
 ) void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
-    buf.appendSlice(alloc, "{\"progressToken\":") catch return;
-    appendJsonValue(alloc, &buf, token);
-    buf.appendSlice(alloc, ",\"progress\":") catch return;
+    const alloc = s.alloc;
+    s.tool_buf.clearRetainingCapacity();
+    s.tool_buf.appendSlice(alloc, "{\"progressToken\":") catch return;
+    appendJsonValue(alloc, &s.tool_buf, token);
+    s.tool_buf.appendSlice(alloc, ",\"progress\":") catch return;
     var tmp: [20]u8 = undefined;
     const ps = std.fmt.bufPrint(&tmp, "{d}", .{progress}) catch return;
-    buf.appendSlice(alloc, ps) catch return;
-    buf.appendSlice(alloc, ",\"total\":") catch return;
+    s.tool_buf.appendSlice(alloc, ps) catch return;
+    s.tool_buf.appendSlice(alloc, ",\"total\":") catch return;
     const ts = std.fmt.bufPrint(&tmp, "{d}", .{total}) catch return;
-    buf.appendSlice(alloc, ts) catch return;
+    s.tool_buf.appendSlice(alloc, ts) catch return;
     if (message.len > 0) {
-        buf.appendSlice(alloc, ",\"message\":\"") catch return;
-        json.writeEscaped(alloc, &buf, message);
-        buf.appendSlice(alloc, "\"") catch return;
+        s.tool_buf.appendSlice(alloc, ",\"message\":\"") catch return;
+        json.writeEscaped(alloc, &s.tool_buf, message);
+        s.tool_buf.appendSlice(alloc, "\"") catch return;
     }
-    buf.appendSlice(alloc, "}") catch return;
+    s.tool_buf.appendSlice(alloc, "}") catch return;
 
-    writeNotification(alloc, stdout, "notifications/progress", buf.items);
+    writeNotification(s, "notifications/progress", s.tool_buf.items);
 }
 
 // ── roots ──────────────────────────────────────────────────────────────────
@@ -255,7 +260,7 @@ fn requestRoots(s: *Session) void {
     const id = s.next_id;
     s.next_id += 1;
     s.pending_roots_id = id;
-    writeRequest(s.alloc, s.stdout, id, "roots/list", "{}");
+    writeRequest(s, id, "roots/list", "{}");
 }
 
 fn handleResponse(s: *Session, root: *const std.json.ObjectMap) void {
@@ -321,14 +326,13 @@ fn handleCall(
     id: ?std.json.Value,
 ) void {
     const alloc = s.alloc;
-    const stdout = s.stdout;
 
     // Unwrap params
     const params_val = root.get("params") orelse {
-        writeError(alloc, stdout, id, -32602, "Missing params"); return;
+        writeError(s, id, -32602, "Missing params"); return;
     };
     if (params_val != .object) {
-        writeError(alloc, stdout, id, -32602, "params must be object"); return;
+        writeError(s, id, -32602, "params must be object"); return;
     }
     const params = &params_val.object;
 
@@ -342,134 +346,137 @@ fn handleCall(
 
     // Tool name
     const name = json.getStr(params, "name") orelse {
-        writeError(alloc, stdout, id, -32602, "Missing tool name"); return;
+        writeError(s, id, -32602, "Missing tool name"); return;
     };
 
     // Arguments
     const args_val = params.get("arguments") orelse {
-        writeError(alloc, stdout, id, -32602, "Missing arguments"); return;
+        writeError(s, id, -32602, "Missing arguments"); return;
     };
     if (args_val != .object) {
-        writeError(alloc, stdout, id, -32602, "arguments must be object"); return;
+        writeError(s, id, -32602, "arguments must be object"); return;
     }
     const args = &args_val.object;
 
     // Dispatch
     const tool = tools.parse(name) orelse {
-        writeError(alloc, stdout, id, -32602, "Unknown tool"); return;
+        writeError(s, id, -32602, "Unknown tool"); return;
     };
 
-    // Run handler → capture output → wrap in MCP content envelope
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    tools.dispatch(alloc, tool, args, &out);
+    // Run handler into reusable tool_buf (clear, not free)
+    s.tool_buf.clearRetainingCapacity();
+    tools.dispatch(alloc, tool, args, &s.tool_buf);
 
-    // (#1) Build result with optional structuredContent
-    var result: std.ArrayList(u8) = .empty;
-    defer result.deinit(alloc);
-    result.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
-    json.writeEscaped(alloc, &result, out.items);
-    result.appendSlice(alloc, "\"}],\"isError\":false") catch return;
+    // Build the complete JSON-RPC response directly into write_buf.
+    // We write the full envelope here (not via writeResult) because the
+    // content envelope is built in-place and we can't pass a slice of
+    // write_buf to writeResult (which also uses write_buf).
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 120 + s.tool_buf.items.len * 2) catch {};
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    appendId(alloc, buf, id);
+    buf.appendSlice(alloc, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
+    json.writeEscaped(alloc, buf, s.tool_buf.items);
+    buf.appendSlice(alloc, "\"}],\"isError\":false") catch return;
 
-    // If output looks like a JSON object, try to include it as structuredContent
-    if (out.items.len > 0 and out.items[0] == '{') {
-        if (isValidJsonObject(alloc, out.items)) {
-            result.appendSlice(alloc, ",\"structuredContent\":") catch return;
-            result.appendSlice(alloc, out.items) catch return;
+    // If output looks like a JSON object, include as structuredContent
+    if (s.tool_buf.items.len > 0 and s.tool_buf.items[0] == '{') {
+        if (isValidJsonObject(s.tool_buf.items)) {
+            buf.appendSlice(alloc, ",\"structuredContent\":") catch return;
+            buf.appendSlice(alloc, s.tool_buf.items) catch return;
         }
     }
 
-    result.appendSlice(alloc, "}") catch return;
-    writeResult(alloc, stdout, id, result.items);
+    buf.appendSlice(alloc, "}}\n") catch return;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
-/// Quick check: is this a parseable JSON object?
-fn isValidJsonObject(alloc: std.mem.Allocator, data: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch return false;
-    defer parsed.deinit();
-    return parsed.value == .object;
+/// Lightweight check for whether data looks like a complete JSON object.
+/// Lightweight check for whether data looks like a complete JSON object.
+/// Validates balanced braces and proper string handling without a full parse.
+/// This avoids re-parsing potentially large tool output just to check structure.
+fn isValidJsonObject(data: []const u8) bool {
+    if (data.len < 2 or data[0] != '{') return false;
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1; // skip escaped char
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else {
+            switch (c) {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                    if (depth == 0) return i == data.len - 1;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
-// ── JSON-RPC 2.0 writers ────────────────────────────────────────────────────
+// ── JSON-RPC 2.0 writers (reuse s.write_buf across calls) ────────────────────
 
 /// Write a JSON-RPC 2.0 result response.
-/// IMPORTANT: strips \n and \r from `result` before writing.
-fn writeResult(
-    alloc: std.mem.Allocator,
-    stdout: std.fs.File,
-    id: ?std.json.Value,
-    result: []const u8,
-) void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
+fn writeResult(s: *Session, id: ?std.json.Value, result: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 40 + result.len) catch {};
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
-    appendId(alloc, &buf, id);
+    appendId(alloc, buf, id);
     buf.appendSlice(alloc, ",\"result\":") catch return;
-    for (result) |c| {
-        if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
-    }
+    appendStrippingNewlines(alloc, buf, result);
     buf.appendSlice(alloc, "}\n") catch return;
-
-    _ = stdout.write(buf.items) catch 0;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
 /// Write a JSON-RPC 2.0 error response.
-fn writeError(
-    alloc: std.mem.Allocator,
-    stdout: std.fs.File,
-    id: ?std.json.Value,
-    code: i32,
-    msg: []const u8,
-) void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
+fn writeError(s: *Session, id: ?std.json.Value, code: i32, msg: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
-    appendId(alloc, &buf, id);
+    appendId(alloc, buf, id);
     buf.appendSlice(alloc, ",\"error\":{\"code\":") catch return;
     var tmp: [12]u8 = undefined;
     const cs = std.fmt.bufPrint(&tmp, "{d}", .{code}) catch return;
     buf.appendSlice(alloc, cs) catch return;
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
-    json.writeEscaped(alloc, &buf, msg);
+    json.writeEscaped(alloc, buf, msg);
     buf.appendSlice(alloc, "\"}}\n") catch return;
-
-    _ = stdout.write(buf.items) catch 0;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
 /// Write a JSON-RPC 2.0 notification (no id, no response expected).
-fn writeNotification(
-    alloc: std.mem.Allocator,
-    stdout: std.fs.File,
-    method: []const u8,
-    params: []const u8,
-) void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
+fn writeNotification(s: *Session, method: []const u8, params: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 40 + method.len + params.len) catch {};
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"method\":\"") catch return;
     buf.appendSlice(alloc, method) catch return;
     buf.appendSlice(alloc, "\",\"params\":") catch return;
-    for (params) |c| {
-        if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
-    }
+    appendStrippingNewlines(alloc, buf, params);
     buf.appendSlice(alloc, "}\n") catch return;
-
-    _ = stdout.write(buf.items) catch 0;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
 /// Write a JSON-RPC 2.0 request (server → client).
-fn writeRequest(
-    alloc: std.mem.Allocator,
-    stdout: std.fs.File,
-    id: i64,
-    method: []const u8,
-    params: []const u8,
-) void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
+fn writeRequest(s: *Session, id: i64, method: []const u8, params: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     var tmp: [20]u8 = undefined;
     const id_str = std.fmt.bufPrint(&tmp, "{d}", .{id}) catch return;
@@ -479,11 +486,21 @@ fn writeRequest(
     buf.appendSlice(alloc, "\",\"params\":") catch return;
     buf.appendSlice(alloc, params) catch return;
     buf.appendSlice(alloc, "}\n") catch return;
-
-    _ = stdout.write(buf.items) catch 0;
+    _ = s.stdout.write(buf.items) catch 0;
 }
 
-/// Append a JSON value (string or integer) to buf — used for progressToken.
+/// Append data to buf, skipping \n and \r characters.
+/// Uses span-based batch copies instead of byte-by-byte append.
+fn appendStrippingNewlines(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
+    var i: usize = 0;
+    while (i < data.len) {
+        const start = i;
+        while (i < data.len and data[i] != '\n' and data[i] != '\r') : (i += 1) {}
+        if (i > start) buf.appendSlice(alloc, data[start..i]) catch return;
+        if (i < data.len) i += 1; // skip the newline/cr
+    }
+}
+
 fn appendJsonValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), val: std.json.Value) void {
     switch (val) {
         .integer => |n| {
@@ -499,7 +516,6 @@ fn appendJsonValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), val: std.j
         else => buf.appendSlice(alloc, "null") catch return,
     }
 }
-
 fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
     if (id) |v| {
         appendJsonValue(alloc, buf, v);
