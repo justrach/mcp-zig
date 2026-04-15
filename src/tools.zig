@@ -46,13 +46,14 @@ pub fn parse(name: []const u8) ?Tool {
 
 pub fn dispatch(
     alloc: std.mem.Allocator,
+    io: std.Io,
     tool: Tool,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
     switch (tool) {
-        .read_file => handleReadFile(alloc, args, out),
-        .list_dir  => handleListDir(alloc, args, out),
+        .read_file => handleReadFile(alloc, io, args, out),
+        .list_dir  => handleListDir(alloc, io, args, out),
         // .add_your_tool_here => handleYourTool(alloc, args, out),
     }
 }
@@ -61,17 +62,50 @@ pub fn dispatch(
 /// Extracts fields directly from the raw JSON string with zero allocations.
 pub fn dispatchFast(
     alloc: std.mem.Allocator,
+    io: std.Io,
     tool: Tool,
     args_raw: []const u8,
     out: *std.ArrayList(u8),
 ) void {
     switch (tool) {
-        .read_file => handleReadFileFast(alloc, args_raw, out),
-        .list_dir  => handleListDirFast(alloc, args_raw, out),
+        .read_file => handleReadFileFast(alloc, io, args_raw, out),
+        .list_dir  => handleListDirFast(alloc, io, args_raw, out),
     }
 }
 
-fn handleReadFileFast(alloc: std.mem.Allocator, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+fn appendFileContents(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    max_bytes: usize,
+    out: *std.ArrayList(u8),
+) void {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |err| {
+        var tmp: [512]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
+        out.appendSlice(alloc, s) catch {};
+        return;
+    };
+    defer file.close(io);
+
+    const start = out.items.len;
+    out.ensureUnusedCapacity(alloc, max_bytes) catch {
+        out.appendSlice(alloc, "error: out of memory") catch {};
+        return;
+    };
+    out.items.len += max_bytes;
+
+    const n = file.readPositionalAll(io, out.items[start..], 0) catch |err| {
+        var tmp: [512]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
+        out.items.len = start;
+        out.appendSlice(alloc, s) catch {};
+        return;
+    };
+    out.items.len = start + n;
+}
+
+fn handleReadFileFast(alloc: std.mem.Allocator, io: std.Io, args_raw: []const u8, out: *std.ArrayList(u8)) void {
     const path = json.scanStr(args_raw, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
         return;
@@ -81,53 +115,29 @@ fn handleReadFileFast(alloc: std.mem.Allocator, args_raw: []const u8, out: *std.
     else
         DEFAULT_MAX_BYTES;
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        var tmp: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
-        out.appendSlice(alloc, s) catch {};
-        return;
-    };
-    defer file.close();
-
-    out.ensureTotalCapacity(alloc, max_bytes) catch {
-        out.appendSlice(alloc, "error: out of memory") catch {};
-        return;
-    };
-    while (out.items.len < max_bytes) {
-        const buf = out.unusedCapacitySlice();
-        if (buf.len == 0) break;
-        const n = file.read(buf) catch |err| {
-            var tmp: [512]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
-            out.clearRetainingCapacity();
-            out.appendSlice(alloc, s) catch {};
-            return;
-        };
-        if (n == 0) break;
-        out.items.len += n;
-    }
+    appendFileContents(alloc, io, path, max_bytes, out);
 }
 
-fn handleListDirFast(alloc: std.mem.Allocator, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+fn handleListDirFast(alloc: std.mem.Allocator, io: std.Io, args_raw: []const u8, out: *std.ArrayList(u8)) void {
     const path = json.scanStr(args_raw, "path") orelse ".";
 
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         var tmp: [512]u8 = undefined;
         const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
         out.appendSlice(alloc, s) catch {};
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         const kind: u8 = switch (entry.kind) {
             .directory => 'd',
             .file      => 'f',
             .sym_link  => 'l',
             else       => '?',
         };
-        var line: [std.fs.max_path_bytes + 4]u8 = undefined;
+        var line: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
         const s = std.fmt.bufPrint(&line, "{c} {s}\n", .{ kind, entry.name }) catch continue;
         out.appendSlice(alloc, s) catch {};
     }
@@ -139,6 +149,7 @@ const DEFAULT_MAX_BYTES = 1024 * 1024; // 1 MB
 
 fn handleReadFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
@@ -151,60 +162,34 @@ fn handleReadFile(
     else
         DEFAULT_MAX_BYTES;
 
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        var tmp: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
-        out.appendSlice(alloc, s) catch {};
-        return;
-    };
-    defer file.close();
-
-    // Read directly into the output buffer to avoid a temporary allocation + copy.
-    // Reserve space up front, then read into the unused tail of the ArrayList.
-    out.ensureTotalCapacity(alloc, max_bytes) catch {
-        out.appendSlice(alloc, "error: out of memory") catch {};
-        return;
-    };
-    while (out.items.len < max_bytes) {
-        const buf = out.unusedCapacitySlice();
-        if (buf.len == 0) break;
-        const n = file.read(buf) catch |err| {
-            var tmp: [512]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "error reading '{s}': {s}", .{ path, @errorName(err) }) catch return;
-            // Reset output, write error instead
-            out.clearRetainingCapacity();
-            out.appendSlice(alloc, s) catch {};
-            return;
-        };
-        if (n == 0) break;
-        out.items.len += n;
-    }
+    appendFileContents(alloc, io, path, max_bytes, out);
 }
 
 fn handleListDir(
     alloc: std.mem.Allocator,
+    io: std.Io,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
 ) void {
     const path = json.getStr(args, "path") orelse ".";
 
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         var tmp: [512]u8 = undefined;
         const s = std.fmt.bufPrint(&tmp, "error opening '{s}': {s}", .{ path, @errorName(err) }) catch return;
         out.appendSlice(alloc, s) catch {};
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         const kind: u8 = switch (entry.kind) {
             .directory => 'd',
             .file      => 'f',
             .sym_link  => 'l',
             else       => '?',
         };
-        var line: [std.fs.max_path_bytes + 4]u8 = undefined;
+        var line: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
         const s = std.fmt.bufPrint(&line, "{c} {s}\n", .{ kind, entry.name }) catch continue;
         out.appendSlice(alloc, s) catch {};
     }

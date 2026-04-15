@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build](https://github.com/justrach/mcp-zig/actions/workflows/build.yml/badge.svg)](https://github.com/justrach/mcp-zig/actions)
-[![Zig](https://img.shields.io/badge/Zig-0.15-f7a41d.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d.svg)](https://ziglang.org)
 [![MCP](https://img.shields.io/badge/MCP-2025--06--18-green.svg)](https://spec.modelcontextprotocol.io)
 
 **Build MCP servers that fit in a tweet-sized binary.**
@@ -87,7 +87,7 @@ Register with Claude Code in `~/.claude.json`:
 
 Restart Claude Code. Your tools appear as `mcp__my-server__read_file`, `mcp__my-server__list_dir`, etc.
 
-Requires [Zig 0.15](https://ziglang.org/download/).
+Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ---
 
@@ -115,9 +115,15 @@ exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
 ```zig
 const mcp = @import("mcp");
 
-// Use the client
+// Use the client from a std.process.Init entry point
 const McpClient = mcp.client.McpClient;
-var client = try McpClient.init(alloc, &.{"/path/to/server"}, null);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    var client = try McpClient.init(alloc, io, &.{"/path/to/server"}, null);
+    defer client.deinit();
+}
 
 // Use the registry
 const my_tools = mcp.registry.Registry(&.{
@@ -242,18 +248,23 @@ mcp-zig includes a client library for calling any MCP server programmatically �
 ```zig
 const McpClient = @import("client.zig").McpClient;
 
-var client = try McpClient.init(alloc, &.{"/path/to/server"}, null);
-defer client.deinit();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
 
-const init_result = try client.initialize();
-defer alloc.free(init_result);
-try client.notifyInitialized();
+    var client = try McpClient.init(alloc, io, &.{"/path/to/server"}, null);
+    defer client.deinit();
 
-const tools = try client.listTools();
-defer alloc.free(tools);
+    const init_result = try client.initialize();
+    defer alloc.free(init_result);
+    try client.notifyInitialized();
 
-const result = try client.callTool("read_file", "{\"path\":\"hello.txt\"}");
-defer alloc.free(result);
+    const tools = try client.listTools();
+    defer alloc.free(tools);
+
+    const result = try client.callTool("read_file", "{\"path\":\"hello.txt\"}");
+    defer alloc.free(result);
+}
 ```
 
 ### One-shot convenience
@@ -262,8 +273,13 @@ defer alloc.free(result);
 const callOnce = @import("client.zig").callOnce;
 
 // Spawn → initialize → call → return → clean up, in one call
-const result = try callOnce(alloc, &.{"/path/to/server"}, "read_file", "{\"path\":\"hello.txt\"}");
-defer alloc.free(result);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    const result = try callOnce(alloc, io, &.{"/path/to/server"}, "read_file", "{\"path\":\"hello.txt\"}");
+    defer alloc.free(result);
+}
 ```
 
 ### CLI example

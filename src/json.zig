@@ -342,22 +342,10 @@ pub fn scanHasKey(data: []const u8, key: []const u8) bool {
 
 /// Legacy API — reads one byte at a time from the raw file handle.
 /// Prefer readLineBuf with a File.Reader for better performance.
-pub fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
-    var line: std.ArrayList(u8) = .empty;
-    var buf: [1]u8 = undefined;
-    while (true) {
-        const n = file.read(&buf) catch {
-            line.deinit(alloc);
-            return null;
-        };
-        if (n == 0) {
-            if (line.items.len == 0) { line.deinit(alloc); return null; }
-            return line.toOwnedSlice(alloc) catch null;
-        }
-        if (buf[0] == '\n') return line.toOwnedSlice(alloc) catch null;
-        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
-        if (line.items.len > MAX_LINE) { line.deinit(alloc); return null; }
-    }
+pub fn readLine(alloc: std.mem.Allocator, io: std.Io, file: std.Io.File) ?[]u8 {
+    var read_buf: [256]u8 = undefined;
+    var reader = file.readerStreaming(io, &read_buf);
+    return readLineBuf(alloc, &reader.interface);
 }
 
 // ── Field extraction ──────────────────────────────────────────────────────────
