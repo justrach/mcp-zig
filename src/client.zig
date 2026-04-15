@@ -8,7 +8,7 @@
 // interleaved between the client's own request/response pairs.
 //
 // Usage:
-//   var client = try McpClient.init(alloc, &.{"/path/to/server"}, null);
+//   var client = try McpClient.init(alloc, io, &.{"/path/to/server"}, null);
 //   defer client.deinit();
 //   try client.initialize();
 //   const tools = try client.listTools();
@@ -19,39 +19,51 @@ const json = @import("json.zig");
 
 pub const McpClient = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     process: std.process.Child,
     next_id: i64,
-    // Buffered reading state — avoids per-byte syscalls in readOneLine
-    stdout_buf: [4096]u8 = undefined,
-    stdout_pos: usize = 0,
-    stdout_len: usize = 0,
+    stdout_reader: std.Io.File.Reader,
+    stdout_buffer: []u8,
+    line_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(
         alloc: std.mem.Allocator,
+        io: std.Io,
         argv: []const []const u8,
         cwd: ?[]const u8,
     ) !McpClient {
-        var child = std.process.Child.init(argv, alloc);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        if (cwd) |d| child.cwd = d;
-        try child.spawn();
+        const stdout_buffer = try alloc.alloc(u8, 4096);
+        errdefer alloc.free(stdout_buffer);
+
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .cwd = if (cwd) |d| .{ .path = d } else .inherit,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
+        errdefer child.kill(io);
+
         return .{
             .alloc = alloc,
+            .io = io,
             .process = child,
             .next_id = 1,
+            .stdout_reader = child.stdout.?.readerStreaming(io, stdout_buffer),
+            .stdout_buffer = stdout_buffer,
         };
     }
 
     pub fn deinit(self: *McpClient) void {
         // Close stdin first to signal the server to exit, then wait.
         // Don't close stdout/stderr manually — process.wait() handles cleanup.
-        if (self.process.stdin) |*s| {
-            s.close();
+        if (self.process.stdin) |stdin| {
+            stdin.close(self.io);
             self.process.stdin = null;
         }
-        _ = self.process.wait() catch {};
+        if (self.process.id != null) _ = self.process.wait(self.io) catch {};
+        self.line_buf.deinit(self.alloc);
+        self.alloc.free(self.stdout_buffer);
     }
 
     // ── High-level API ──────────────────────────────────────────────────────
@@ -68,7 +80,7 @@ pub const McpClient = struct {
     pub fn notifyInitialized(self: *McpClient) !void {
         const msg = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
         const stdin = self.process.stdin orelse return error.StdinClosed;
-        _ = try stdin.write(msg);
+        try stdin.writeStreamingAll(self.io, msg);
     }
 
     /// List available tools. Returns raw JSON result string.
@@ -100,7 +112,7 @@ pub const McpClient = struct {
         buf.appendSlice(self.alloc, "}}\n") catch return error.OutOfMemory;
 
         const stdin = self.process.stdin orelse return error.StdinClosed;
-        _ = try stdin.write(buf.items);
+        try stdin.writeStreamingAll(self.io, buf.items);
 
         return self.readResponse();
     }
@@ -137,7 +149,7 @@ pub const McpClient = struct {
         buf.append(self.alloc, '\n') catch return error.OutOfMemory;
 
         const stdin = self.process.stdin orelse return error.StdinClosed;
-        _ = try stdin.write(buf.items);
+        try stdin.writeStreamingAll(self.io, buf.items);
 
         return self.readResponse();
     }
@@ -161,57 +173,11 @@ pub const McpClient = struct {
     }
 
     /// Read exactly one newline-terminated line from the server's stdout.
-    /// Uses internal 4KB buffer to batch syscalls — typically 1 read per response
-    /// instead of 1 read per byte.
     fn readOneLine(self: *McpClient) ![]u8 {
-        const stdout = self.process.stdout orelse return error.StdoutClosed;
-
-        var line: std.ArrayList(u8) = .empty;
-        while (true) {
-            // Refill buffer if exhausted
-            if (self.stdout_pos >= self.stdout_len) {
-                const n = try stdout.read(&self.stdout_buf);
-                if (n == 0) {
-                    if (line.items.len > 0) {
-                        return line.toOwnedSlice(self.alloc) catch {
-                            line.deinit(self.alloc);
-                            return error.OutOfMemory;
-                        };
-                    }
-                    line.deinit(self.alloc);
-                    return error.ServerClosed;
-                }
-                self.stdout_pos = 0;
-                self.stdout_len = n;
-            }
-
-            // Scan for newline in buffered data
-            const remaining = self.stdout_buf[self.stdout_pos..self.stdout_len];
-            if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
-                line.appendSlice(self.alloc, remaining[0..nl_pos]) catch {
-                    line.deinit(self.alloc);
-                    return error.OutOfMemory;
-                };
-                self.stdout_pos += nl_pos + 1;
-                break;
-            } else {
-                line.appendSlice(self.alloc, remaining) catch {
-                    line.deinit(self.alloc);
-                    return error.OutOfMemory;
-                };
-                self.stdout_pos = self.stdout_len;
-            }
-
-            if (line.items.len > json.MAX_LINE) {
-                line.deinit(self.alloc);
-                return error.ResponseTooLarge;
-            }
-        }
-
-        return line.toOwnedSlice(self.alloc) catch {
-            line.deinit(self.alloc);
-            return error.OutOfMemory;
-        };
+        const line = json.readLineInto(self.alloc, &self.stdout_reader.interface, &self.line_buf) orelse
+            return error.ServerClosed;
+        if (line.len > json.MAX_LINE) return error.ResponseTooLarge;
+        return self.alloc.dupe(u8, line);
     }
 
     /// If `line` is a server-to-client request (has "method" field), respond and return true.
@@ -248,22 +214,22 @@ pub const McpClient = struct {
         buf.appendSlice(self.alloc, ",\"result\":{\"roots\":[{\"uri\":\"file://") catch return;
 
         // Use cwd as the default root
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch {
+        const cwd = std.process.currentPathAlloc(self.io, self.alloc) catch {
             // Fallback: empty roots
             buf.clearRetainingCapacity();
             buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
             appendId(self.alloc, &buf, id);
             buf.appendSlice(self.alloc, ",\"result\":{\"roots\":[]}}\n") catch return;
             const stdin = self.process.stdin orelse return;
-            _ = stdin.write(buf.items) catch {};
+            stdin.writeStreamingAll(self.io, buf.items) catch {};
             return;
         };
+        defer self.alloc.free(cwd);
         json.writeEscaped(self.alloc, &buf, cwd);
         buf.appendSlice(self.alloc, "\",\"name\":\"workspace\"}]}}\n") catch return;
 
         const stdin = self.process.stdin orelse return;
-        _ = stdin.write(buf.items) catch {};
+        stdin.writeStreamingAll(self.io, buf.items) catch {};
     }
 
     /// Send a JSON-RPC error response to the server.
@@ -282,7 +248,7 @@ pub const McpClient = struct {
         buf.appendSlice(self.alloc, "\"}}\n") catch return;
 
         const stdin = self.process.stdin orelse return;
-        _ = stdin.write(buf.items) catch {};
+        stdin.writeStreamingAll(self.io, buf.items) catch {};
     }
 
     fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
@@ -310,11 +276,12 @@ pub const McpClient = struct {
 /// Convenience for scripts that just need a single tool call.
 pub fn callOnce(
     alloc: std.mem.Allocator,
+    io: std.Io,
     server_argv: []const []const u8,
     tool_name: []const u8,
     args_json: []const u8,
 ) ![]u8 {
-    var client = try McpClient.init(alloc, server_argv, null);
+    var client = try McpClient.init(alloc, io, server_argv, null);
     defer client.deinit();
 
     const init_result = try client.initialize();

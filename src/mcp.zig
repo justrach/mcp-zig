@@ -60,7 +60,8 @@ pub const Root = struct {
 /// MCP session state — tracks client capabilities, workspace roots, and log level.
 const Session = struct {
     alloc: std.mem.Allocator,
-    stdout: std.fs.File,
+    io: std.Io,
+    stdout: std.Io.File,
     next_id: i64 = 100, // start high to avoid collision with client IDs
 
     // Client capabilities (parsed from initialize request)
@@ -99,14 +100,15 @@ const Session = struct {
     }
 };
 
-pub fn run(alloc: std.mem.Allocator) void {
+pub fn run(alloc: std.mem.Allocator, io: std.Io) void {
     var session: Session = .{
         .alloc = alloc,
-        .stdout = std.fs.File.stdout(),
+        .io = io,
+        .stdout = std.Io.File.stdout(),
     };
     defer session.deinit();
     var read_buf: [4096]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&read_buf);
+    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
 
     // Comptime perfect-hash method dispatch table — O(1) lookup, no sequential string comparisons.
     const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled };
@@ -185,7 +187,7 @@ fn handleCall(
 
     // Run handler into reusable tool_buf (clear, not free)
     s.tool_buf.clearRetainingCapacity();
-    tools.dispatchFast(alloc, tool, args_raw, &s.tool_buf);
+    tools.dispatchFast(alloc, s.io, tool, args_raw, &s.tool_buf);
 
     // Build the complete JSON-RPC response directly into write_buf.
     const buf = &s.write_buf;
@@ -206,7 +208,7 @@ fn handleCall(
     }
 
     buf.appendSlice(alloc, "}}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -424,7 +426,7 @@ fn writeResultRaw(s: *Session, id_raw: ?[]const u8, result: []const u8) void {
     buf.appendSlice(alloc, ",\"result\":") catch return;
     appendStrippingNewlines(alloc, buf, result);
     buf.appendSlice(alloc, "}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Write an error response using a raw id string (from scanner — avoids JSON parse).
@@ -441,7 +443,7 @@ fn writeErrorRaw(s: *Session, id_raw: ?[]const u8, code: i32, msg: []const u8) v
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
     json.writeEscaped(alloc, buf, msg);
     buf.appendSlice(alloc, "\"}}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Write a JSON-RPC 2.0 result response.
@@ -455,7 +457,7 @@ fn writeResult(s: *Session, id: ?std.json.Value, result: []const u8) void {
     buf.appendSlice(alloc, ",\"result\":") catch return;
     appendStrippingNewlines(alloc, buf, result);
     buf.appendSlice(alloc, "}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Write a JSON-RPC 2.0 error response.
@@ -472,7 +474,7 @@ fn writeError(s: *Session, id: ?std.json.Value, code: i32, msg: []const u8) void
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
     json.writeEscaped(alloc, buf, msg);
     buf.appendSlice(alloc, "\"}}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Write a JSON-RPC 2.0 notification (no id, no response expected).
@@ -486,7 +488,7 @@ fn writeNotification(s: *Session, method: []const u8, params: []const u8) void {
     buf.appendSlice(alloc, "\",\"params\":") catch return;
     appendStrippingNewlines(alloc, buf, params);
     buf.appendSlice(alloc, "}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Write a JSON-RPC 2.0 request (server → client).
@@ -503,7 +505,7 @@ fn writeRequest(s: *Session, id: i64, method: []const u8, params: []const u8) vo
     buf.appendSlice(alloc, "\",\"params\":") catch return;
     buf.appendSlice(alloc, params) catch return;
     buf.appendSlice(alloc, "}\n") catch return;
-    _ = s.stdout.write(buf.items) catch 0;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
 /// Append data to buf, skipping \n and \r characters.

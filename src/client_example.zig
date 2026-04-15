@@ -6,19 +6,26 @@
 //        or:  zig-out/bin/mcp-client /path/to/server
 
 const std = @import("std");
+const Io = std.Io;
 const McpClient = @import("client.zig").McpClient;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print(
+        try stderr.print(
             \\mcp-client — MCP client example
             \\
             \\Usage: mcp-client <server-path> [tool-name] [args-json]
@@ -27,7 +34,8 @@ pub fn main() !void {
             \\  mcp-client ./zig-out/bin/mcp-zig
             \\  mcp-client ./zig-out/bin/mcp-zig read_file '{{"path":"README.md"}}'
             \\
-        , .{}) catch {};
+        , .{});
+        try stderr.flush();
         return;
     }
 
@@ -35,36 +43,35 @@ pub fn main() !void {
     const tool_name = if (args.len > 2) args[2] else null;
     const tool_args = if (args.len > 3) args[3] else "{}";
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-
     // Spawn server
-    var client = try McpClient.init(alloc, &.{server_path}, null);
+    var client = try McpClient.init(alloc, io, &.{server_path}, null);
     defer client.deinit();
 
     // Initialize
-    stdout.print("→ initialize\n", .{}) catch {};
+    try stdout.print("→ initialize\n", .{});
     const init_result = try client.initialize();
     defer alloc.free(init_result);
-    stdout.print("← {s}\n\n", .{init_result}) catch {};
+    try stdout.print("← {s}\n\n", .{init_result});
 
     try client.notifyInitialized();
 
     // List tools
-    stdout.print("→ tools/list\n", .{}) catch {};
+    try stdout.print("→ tools/list\n", .{});
     const tools_result = try client.listTools();
     defer alloc.free(tools_result);
-    stdout.print("← {s}\n\n", .{tools_result}) catch {};
+    try stdout.print("← {s}\n\n", .{tools_result});
 
     // Call tool (if specified)
     if (tool_name) |name| {
-        stdout.print("→ tools/call: {s}({s})\n", .{ name, tool_args }) catch {};
+        try stdout.print("→ tools/call: {s}({s})\n", .{ name, tool_args });
         const call_result = try client.callTool(name, tool_args);
         defer alloc.free(call_result);
-        stdout.print("← {s}\n", .{call_result}) catch {};
+        try stdout.print("← {s}\n", .{call_result});
     }
 
     // Ping
-    stdout.print("\n→ ping\n", .{}) catch {};
+    try stdout.print("\n→ ping\n", .{});
     const alive = try client.ping();
-    stdout.print("← pong: {}\n", .{alive}) catch {};
+    try stdout.print("← pong: {}\n", .{alive});
+    try stdout.flush();
 }
