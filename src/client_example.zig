@@ -6,13 +6,17 @@
 //        or:  zig-out/bin/mcp-client /path/to/server
 
 const std = @import("std");
-const Io = std.Io;
 const McpClient = @import("client.zig").McpClient;
+const runtime = @import("runtime.zig");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
-    const io = init.io;
     const arena = init.arena.allocator();
+    var rt = try runtime.Runtime.init(alloc, init);
+    defer rt.deinit();
+    const io = rt.io();
+
+    const Io = std.Io;
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
