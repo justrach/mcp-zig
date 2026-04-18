@@ -288,7 +288,10 @@ pub fn main(init: std.process.Init) !void {
 zig build
 ./zig-out/bin/mcp-client ./zig-out/bin/mcp-zig                          # list tools
 ./zig-out/bin/mcp-client ./zig-out/bin/mcp-zig read_file '{"path":"."}'  # call a tool
+./zig-out/bin/mcp-client ./zig-out/bin/mcp-zig batch '{"operations":[{"tool":"read_file","arguments":{"path":"README.md","max_bytes":80}},{"tool":"list_dir","arguments":{"path":"src"}}]}'
 ```
+
+The `batch` tool returns a structured JSON object with ordered per-item results, so clients can group several filesystem reads into a single `tools/call` without losing partial-failure information.
 
 ---
 
@@ -297,9 +300,12 @@ zig build
 ```bash
 zig build                              # debug (fast compile)
 zig build -Doptimize=ReleaseSmall      # release (small binary)
+zig build -Dio-backend=evented         # Linux only; macOS/other targets fall back to threaded
 strip zig-out/bin/mcp-zig              # shrink further
 codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 ```
+
+`mcp-zig` uses `std.Io.Threaded` by default. The `-Dio-backend=evented` option is gated to Linux builds so you can experiment with `std.Io.Evented` there without pulling in the current macOS `Dispatch` backend issues. On macOS and other non-Linux targets, the binaries continue to use `Threaded`.
 
 ---
 

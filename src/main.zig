@@ -12,7 +12,11 @@
 
 const std = @import("std");
 const mcp = @import("mcp.zig");
+const runtime = @import("runtime.zig");
 
-pub fn main(init: std.process.Init) void {
-    mcp.run(init.arena.allocator(), init.io);
+pub fn main(init: std.process.Init) !void {
+    var rt = try runtime.Runtime.init(init.gpa, init);
+    defer rt.deinit();
+
+    mcp.run(init.arena.allocator(), rt.io());
 }
