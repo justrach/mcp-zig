@@ -87,6 +87,16 @@ Register with Claude Code in `~/.claude.json`:
 
 Restart Claude Code. Your tools appear as `mcp__my-server__read_file`, `mcp__my-server__list_dir`, etc.
 
+Run the same server over HTTP for remote MCP clients:
+
+```bash
+zig-out/bin/mcp-zig --http 127.0.0.1:8000
+```
+
+The HTTP transport serves MCP JSON-RPC on `POST /mcp`. `initialize` returns an
+`Mcp-Session-Id` header; send that header on later `tools/list` and
+`tools/call` requests.
+
 Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ---
@@ -143,6 +153,7 @@ src/
   main.zig           — entry point (5 lines of logic)
   lib.zig            — package root (re-exports public API)
   mcp.zig            — MCP protocol loop + session state (roots, capabilities)
+  http.zig           — Streamable HTTP transport entry point (/mcp)
   tools.zig          — YOUR TOOLS GO HERE (read_file + list_dir as examples)
   json.zig           — line reader, field extraction, JSON escaping
   registry.zig       — comptime tool registry (optional, reduces boilerplate)
@@ -317,6 +328,11 @@ MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per lin
 
 The `writeResult` function in `mcp.zig` strips `\n` and `\r` from result strings before writing. This matters because Zig `\\` multiline string literals embed literal newlines — without stripping, Claude Code's ReadBuffer would parse each line as a separate (invalid) JSON-RPC message and kill the server.
 
+MCP over HTTP is available with `mcp-zig --http [host:port]`. The first
+implementation supports `POST /mcp` request/response JSON-RPC with session
+headers, plus `GET /mcp` as an SSE-compatible placeholder event. Resumable
+long-lived SSE streams are still future work.
+
 ### What's new in v0.2.0 (2025-06-18 protocol)
 
 | Feature | Description |
@@ -356,7 +372,7 @@ Client                          Server
 - Elicitation — server requesting user input via client UI
 - Resource links — returning `ResourceLink` content blocks from tools
 - Completions — autocomplete for tool arguments
-- Streamable HTTP transport (beyond stdio)
+- Resumable Streamable HTTP SSE event store
 - More example tools (database queries, HTTP requests, file watchers)
 - Cross-compilation targets (Linux, Windows from macOS)
 - Benchmark suite for latency and throughput profiling

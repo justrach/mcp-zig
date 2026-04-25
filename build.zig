@@ -6,7 +6,7 @@ const IoBackend = enum {
 };
 
 pub fn build(b: *std.Build) void {
-    const target   = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const requested_backend = b.option(
         IoBackend,
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     // ── Library module (for consumers using mcp-zig as a dependency) ──────────
     _ = b.addModule("mcp", .{
         .root_source_file = b.path("src/lib.zig"),
-        .target   = target,
+        .target = target,
         .optimize = optimize,
     });
 
@@ -30,10 +30,10 @@ pub fn build(b: *std.Build) void {
         .name = "mcp-zig",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
-            .target   = target,
+            .target = target,
             .optimize = optimize,
             .single_threaded = !evented_enabled, // evented backend requires threaded runtime support
-            .strip = true,           // smaller binary, faster page-in
+            .strip = true, // smaller binary, faster page-in
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     // zig build run — start the server (useful for manual smoke-testing)
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |a| for (a) |arg| run_cmd.addArg(arg);
     const run_step = b.step("run", "Run the MCP server");
     run_step.dependOn(&run_cmd.step);
 
@@ -50,7 +51,7 @@ pub fn build(b: *std.Build) void {
         .name = "mcp-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/client_example.zig"),
-            .target   = target,
+            .target = target,
             .optimize = optimize,
         }),
     });

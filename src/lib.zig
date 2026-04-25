@@ -8,6 +8,7 @@
 //   const wrapFn = mcp.registry.wrapFn;
 
 pub const mcp = @import("mcp.zig");
+pub const http = @import("http.zig");
 pub const json = @import("json.zig");
 pub const registry = @import("registry.zig");
 pub const client = @import("client.zig");
