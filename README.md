@@ -155,8 +155,10 @@ src/
   registry.zig       — comptime tool registry (optional, reduces boilerplate)
   client.zig         — MCP client library (spawn server, call tools)
   client_example.zig — client CLI example
+examples/
+  package-provider/  — package.mcp() provider + server app example
 build.zig
-build.zig.zon        — package manifest (v0.2.0)
+build.zig.zon        — package manifest (v0.3.0)
 ```
 
 **To add your own tools**, edit `tools.zig` when using this repo as a template. Downstream packages can keep their own tool module and pass it to `mcp.runWithRegistry()` or `mcp.http.serveWithRegistry()` without copying source files.
@@ -317,6 +319,28 @@ pub fn main(init: std.process.Init) !void {
 
 `pub const mcp_tools = mcp_zig.registry.pack(...)` is also supported when a library prefers a data export, and apps can compose those explicitly with `mcp.registry.fromPacks(.{ lib.mcp_tools, other.mcp_tools })`.
 
+### Full package example
+
+The repository includes a buildable example at `examples/package-provider` showing the two-package shape:
+
+- `src/tool_package.zig` acts like a reusable library and exposes `pub fn mcp() mcp_zig.registry.ToolPack`.
+- `src/package_server.zig` imports that package, mounts it with `mcp.registry.fromPackages(.{example_tools})`, and serves it over stdio or HTTP.
+- `build.zig.zon` shows how a consumer project depends on `mcp_zig`; it uses a local `.path = "../.."` in this checkout, while external projects should use the URL/hash dependency form above.
+
+Run it from the repo root:
+
+```bash
+zig build package-example
+./zig-out/bin/mcp-package-server-example
+./zig-out/bin/mcp-package-server-example --http 127.0.0.1:8000
+```
+
+Or build it as its own consumer project:
+
+```bash
+zig build --build-file examples/package-provider/build.zig
+```
+
 ---
 
 ## Client — calling MCP servers from Zig
@@ -401,6 +425,29 @@ MCP over HTTP is available with `mcp-zig --http [host:port]`. The first
 implementation supports `POST /mcp` request/response JSON-RPC with session
 headers, plus `GET /mcp` as an SSE-compatible placeholder event. Resumable
 long-lived SSE streams are still future work.
+
+### Rust SDK conformance notes
+
+The Rust SDK centers on a service/handler object that exposes MCP capabilities and is attached to a transport with `.serve(...)`. mcp-zig now follows the same separation of concerns in Zig form:
+
+| Rust SDK concept | mcp-zig equivalent |
+|------------------|--------------------|
+| service/handler exposing tools | package/module exposing `pub fn mcp() ToolPack` |
+| tool router/list/call wiring | `mcp.registry.fromPackages(...)` or `Registry(...)` |
+| stdio transport | `mcp.runWithRegistry(...)` |
+| Streamable HTTP transport | `mcp.http.serveWithRegistry(...)` |
+| client over child-process stdio | `mcp.client.McpClient` |
+
+Current scope: mcp-zig conforms to MCP's JSON-RPC lifecycle for initialization, tools/list, tools/call, ping, stdio, and the initial HTTP request/response flow. It also tracks roots, logging level, cancellation, and progress notifications. It does not yet expose Rust-SDK-style first-class resources, prompts, completions, sampling, elicitation, or resumable Streamable HTTP SSE.
+
+### What's new in v0.3.0
+
+| Feature | Description |
+|---------|------------|
+| **Package providers** | External Zig libraries can expose `pub fn mcp() ToolPack` and be mounted with `mcp.registry.fromPackages(...)` |
+| **Tool packs** | Libraries can export `mcp.registry.pack(...)` data packs and apps can combine them with `fromPacks(...)` |
+| **Injectable transports** | Stdio and HTTP servers can run any compatible registry through `runWithRegistry(...)` and `serveWithRegistry(...)` |
+| **Buildable package example** | `examples/package-provider` demonstrates the `build.zig.zon` consumer setup |
 
 ### What's new in v0.2.0 (2025-06-18 protocol)
 

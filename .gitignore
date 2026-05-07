@@ -1,6 +1,8 @@
 .DS_Store
 .zig-cache/
 zig-out/
+examples/**/.zig-cache/
+examples/**/zig-out/
 .claude/
 *.bak
 *~

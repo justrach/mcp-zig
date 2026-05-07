@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "evented_enabled", evented_enabled);
 
     // ── Library module (for consumers using mcp-zig as a dependency) ──────────
-    _ = b.addModule("mcp", .{
+    const mcp_module = b.addModule("mcp", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -64,4 +64,27 @@ pub fn build(b: *std.Build) void {
     if (b.args) |a| for (a) |arg| run_client.addArg(arg);
     const run_client_step = b.step("run-client", "Run the MCP client example");
     run_client_step.dependOn(&run_client.step);
+
+    // ── Package-provider example executable ──────────────────────────────────
+    const example_tools = b.createModule(.{
+        .root_source_file = b.path("examples/package-provider/src/tool_package.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    example_tools.addImport("mcp", mcp_module);
+
+    const package_example = b.addExecutable(.{
+        .name = "mcp-package-server-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/package-provider/src/package_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    package_example.root_module.addImport("mcp", mcp_module);
+    package_example.root_module.addImport("example_tools", example_tools);
+
+    const package_example_install = b.addInstallArtifact(package_example, .{});
+    const package_example_step = b.step("package-example", "Build the package-provider example");
+    package_example_step.dependOn(&package_example_install.step);
 }

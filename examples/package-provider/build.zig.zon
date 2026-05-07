@@ -1,0 +1,16 @@
+.{
+    .name = .mcp_zig_package_server_example,
+    .fingerprint = 0x441411af5746130a,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // In this repository this points at the local checkout.
+        // In an external project, use the URL/hash form shown in the README.
+        .mcp_zig = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
