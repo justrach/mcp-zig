@@ -123,24 +123,20 @@ exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
 
 **3. Import in your code:**
 ```zig
+const std = @import("std");
 const mcp = @import("mcp");
 
-// Use the client from a std.process.Init entry point
-const McpClient = mcp.client.McpClient;
-pub fn main(init: std.process.Init) !void {
-    const alloc = init.gpa;
-    const io = init.io;
-
-    var client = try McpClient.init(alloc, io, &.{"/path/to/server"}, null);
-    defer client.deinit();
-}
-
-// Use the registry
 const my_tools = mcp.registry.Registry(&.{
     .{ .name = "my_tool", .handler = myHandler, .schema = my_schema },
 });
 
-// Use JSON helpers
+pub fn main(init: std.process.Init) !void {
+    mcp.runWithRegistry(init.arena.allocator(), init.io, my_tools);
+    // Or HTTP: try mcp.http.serveWithRegistry(init.io, init.gpa, .{ .port = 8000 }, my_tools);
+}
+
+// Client, JSON helpers, and the built-in template tools are also exported:
+const McpClient = mcp.client.McpClient;
 const value = mcp.json.getStr(args, "key");
 ```
 
@@ -163,7 +159,7 @@ build.zig
 build.zig.zon        — package manifest (v0.2.0)
 ```
 
-**To add your own tools**, edit `tools.zig`. Or use `registry.zig` to cut it down to a single definition.
+**To add your own tools**, edit `tools.zig` when using this repo as a template. Downstream packages can keep their own tool module and pass it to `mcp.runWithRegistry()` or `mcp.http.serveWithRegistry()` without copying source files.
 
 ---
 
@@ -220,7 +216,7 @@ Whatever you write to `out` becomes the tool response shown to Claude. Errors go
 
 ## Comptime registry — 1 step (optional)
 
-`registry.zig` reduces the 4-step process to a single definition. It generates `parse()`, `dispatch()`, and `tools_list` at compile time.
+`registry.zig` reduces the 4-step process to a single definition. It generates `parse()`, `dispatch()`, `dispatchFast()`, and `tools_list` at compile time, matching the injectable server registry interface.
 
 ```zig
 const registry = @import("registry.zig");
@@ -232,6 +228,7 @@ const my_tools = registry.Registry(&.{
 
 // my_tools.parse("read_file")   → 0
 // my_tools.dispatch(alloc, 0, args, out)
+// my_tools.dispatchFast(alloc, io, 0, "{}", out)
 // my_tools.tools_list           → combined JSON
 ```
 
@@ -247,6 +244,78 @@ const handler = registry.wrapFn(greet, &.{"name"});
 ```
 
 `wrapFn` inspects the function signature at compile time and generates parameter extraction from JSON args (`[]const u8` → `getStr`, `i64` → `getInt`, `bool` → `getBool`). Error unions are caught and their error names written as error messages.
+
+### Custom server without copying mcp-zig sources
+
+A downstream project can depend on `mcp-zig`, define its own registry, and reuse the stdio or HTTP transports directly:
+
+```zig
+const std = @import("std");
+const mcp = @import("mcp");
+
+const echo_schema =
+    \\{"name":"echo","description":"Echo a message.","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}}
+;
+
+fn echo(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const message = mcp.json.getStr(args, "message") orelse "";
+    out.appendSlice(alloc, message) catch {};
+}
+
+const tools = mcp.registry.Registry(&.{
+    .{ .name = "echo", .handler = echo, .schema = echo_schema },
+});
+
+pub fn main(init: std.process.Init) !void {
+    mcp.runWithRegistry(init.arena.allocator(), init.io, tools);
+    // Or HTTP: try mcp.http.serveWithRegistry(init.io, init.gpa, .{ .port = 8000 }, tools);
+}
+```
+
+For fully custom fast paths, provide a registry type with `tools_list`, `parse(name)`, and `dispatchFast(alloc, io, tool, args_raw, out)`. Add `initialize_result` if you want custom `serverInfo` or `instructions` in the MCP `initialize` response.
+
+### Package-level MCP providers
+
+Reusable Zig libraries can expose their own APIs as MCP tools without becoming server apps. The package convention is a public `mcp()` function:
+
+```zig
+// inside a library package, e.g. mydb/root.zig
+const std = @import("std");
+const mcp_zig = @import("mcp");
+
+const query_schema =
+    \\{"name":"mydb_query","description":"Run a query.","inputSchema":{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}}
+;
+
+fn query(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const sql = mcp_zig.json.getStr(args, "sql") orelse "";
+    // Call the library's real API here, then write the MCP result.
+    out.appendSlice(alloc, sql) catch {};
+}
+
+pub fn mcp() mcp_zig.registry.ToolPack {
+    return mcp_zig.registry.pack(&.{
+        .{ .name = "mydb_query", .handler = query, .schema = query_schema },
+    });
+}
+```
+
+Then an MCP server app can mount packages directly:
+
+```zig
+const std = @import("std");
+const mcp = @import("mcp");
+const mydb = @import("mydb");
+const search = @import("search");
+
+const Registry = mcp.registry.fromPackages(.{ mydb, search });
+
+pub fn main(init: std.process.Init) !void {
+    mcp.runWithRegistry(init.arena.allocator(), init.io, Registry);
+}
+```
+
+`pub const mcp_tools = mcp_zig.registry.pack(...)` is also supported when a library prefers a data export, and apps can compose those explicitly with `mcp.registry.fromPacks(.{ lib.mcp_tools, other.mcp_tools })`.
 
 ---
 

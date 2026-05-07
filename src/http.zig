@@ -5,12 +5,10 @@
 
 const std = @import("std");
 const json = @import("json.zig");
-const tools = @import("tools.zig");
+const protocol = @import("mcp.zig");
+const default_tools = @import("tools.zig");
 
-const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_RESULT =
-    \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
-;
+const PROTOCOL_VERSION = protocol.PROTOCOL_VERSION;
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
@@ -94,6 +92,12 @@ const Conn = struct {
 };
 
 pub fn serve(io: std.Io, allocator: std.mem.Allocator, opts: Options) !void {
+    try serveWithRegistry(io, allocator, opts, default_tools);
+}
+
+pub fn serveWithRegistry(io: std.Io, allocator: std.mem.Allocator, opts: Options, comptime Registry: type) !void {
+    protocol.validateRegistry(Registry);
+
     const addr = try std.Io.net.IpAddress.parse(opts.host, opts.port);
     var listener = try addr.listen(io, .{
         .reuse_address = true,
@@ -112,7 +116,7 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, opts: Options) !void {
             error.WouldBlock, error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(io, allocator, stream, &sessions);
+        handleConnection(Registry, io, allocator, stream, &sessions);
         stream.close(io);
     }
 }
@@ -124,6 +128,7 @@ fn readSome(io: std.Io, stream: std.Io.net.Stream, dest: []u8) !usize {
 }
 
 fn handleConnection(
+    comptime Registry: type,
     io: std.Io,
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
@@ -201,10 +206,11 @@ fn handleConnection(
         return;
     }
 
-    handlePost(allocator, io, &conn, sessions, req);
+    handlePost(Registry, allocator, io, &conn, sessions, req);
 }
 
 fn handlePost(
+    comptime Registry: type,
     allocator: std.mem.Allocator,
     io: std.Io,
     conn: *Conn,
@@ -236,7 +242,7 @@ fn handlePost(
         };
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
-        appendRpcResultRaw(allocator, &body, scan.id_raw, SERVER_RESULT);
+        appendRpcResultRaw(allocator, &body, scan.id_raw, protocol.initializeResult(Registry));
         respondJson(conn, "200 OK", body.items, session_id);
         return;
     }
@@ -261,9 +267,9 @@ fn handlePost(
     if (std.mem.eql(u8, method, "ping")) {
         appendRpcResultRaw(allocator, &body, scan.id_raw, "{}");
     } else if (std.mem.eql(u8, method, "tools/list")) {
-        appendRpcResultRaw(allocator, &body, scan.id_raw, tools.tools_list);
+        appendRpcResultRaw(allocator, &body, scan.id_raw, Registry.tools_list);
     } else if (std.mem.eql(u8, method, "tools/call")) {
-        appendToolCallResult(allocator, io, &body, &scan);
+        appendToolCallResult(Registry, allocator, io, &body, &scan);
     } else if (std.mem.eql(u8, method, "logging/setLevel")) {
         appendRpcResultRaw(allocator, &body, scan.id_raw, "{}");
     } else {
@@ -274,6 +280,7 @@ fn handlePost(
 }
 
 fn appendToolCallResult(
+    comptime Registry: type,
     allocator: std.mem.Allocator,
     io: std.Io,
     body: *std.ArrayList(u8),
@@ -291,14 +298,14 @@ fn appendToolCallResult(
         appendRpcError(allocator, body, scan.id_raw, -32602, "Missing arguments");
         return;
     };
-    const tool = tools.parse(name) orelse {
+    const tool = Registry.parse(name) orelse {
         appendRpcError(allocator, body, scan.id_raw, -32602, "Unknown tool");
         return;
     };
 
     var tool_buf: std.ArrayList(u8) = .empty;
     defer tool_buf.deinit(allocator);
-    tools.dispatchFast(allocator, io, tool, args_raw, &tool_buf);
+    Registry.dispatchFast(allocator, io, tool, args_raw, &tool_buf);
 
     body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     body.appendSlice(allocator, scan.id_raw orelse "null") catch return;

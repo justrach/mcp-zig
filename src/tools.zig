@@ -1,6 +1,6 @@
 // mcp-zig — Tool definitions
 //
-// THIS IS THE ONLY FILE YOU NEED TO EDIT to add new tools.
+// When using this repo as a template, this is the only file you need to edit to add new tools.
 //
 // Four steps:
 //   1. Add the tool name to the `Tool` enum

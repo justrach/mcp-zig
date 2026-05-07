@@ -28,7 +28,34 @@
 
 const std = @import("std");
 const json = @import("json.zig");
-const tools = @import("tools.zig");
+const default_tools = @import("tools.zig");
+
+pub const PROTOCOL_VERSION = "2025-06-18";
+pub const DEFAULT_INITIALIZE_RESULT =
+    \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
+;
+
+/// Validate that a tool registry provides the server-facing API.
+pub fn validateRegistry(comptime Registry: type) void {
+    if (!@hasDecl(Registry, "tools_list")) {
+        @compileError("MCP registry " ++ @typeName(Registry) ++ " must expose pub const tools_list");
+    }
+    if (!@hasDecl(Registry, "parse")) {
+        @compileError("MCP registry " ++ @typeName(Registry) ++ " must expose pub fn parse(name: []const u8)");
+    }
+    if (!@hasDecl(Registry, "dispatchFast")) {
+        @compileError("MCP registry " ++ @typeName(Registry) ++ " must expose pub fn dispatchFast(alloc, io, tool, args_raw, out)");
+    }
+}
+
+/// Return the initialize result JSON for a registry.
+/// Registries may override server metadata/instructions with
+/// `pub const initialize_result = "{...}"`.
+pub fn initializeResult(comptime Registry: type) []const u8 {
+    validateRegistry(Registry);
+    if (@hasDecl(Registry, "initialize_result")) return Registry.initialize_result;
+    return DEFAULT_INITIALIZE_RESULT;
+}
 
 // ── Log levels (RFC 5424 severity) ──────────────────────────────────────────
 
@@ -100,7 +127,25 @@ const Session = struct {
     }
 };
 
+/// Server factory for downstream apps that provide their own tool registry.
+pub fn Server(comptime Registry: type) type {
+    validateRegistry(Registry);
+    return struct {
+        pub fn run(alloc: std.mem.Allocator, io: std.Io) void {
+            runWithRegistry(alloc, io, Registry);
+        }
+    };
+}
+
+/// Run the default template server with the built-in filesystem tools.
 pub fn run(alloc: std.mem.Allocator, io: std.Io) void {
+    runWithRegistry(alloc, io, default_tools);
+}
+
+/// Run an MCP stdio server with an externally supplied tool registry.
+pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: type) void {
+    validateRegistry(Registry);
+
     var session: Session = .{
         .alloc = alloc,
         .io = io,
@@ -135,16 +180,16 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io) void {
             if (method_map.get(method)) |m| switch (m) {
                 // Fast path: no JSON parse needed — zero allocations
                 .ping => writeResultRaw(&session, scan.id_raw, "{}"),
-                .tools_list => writeResultRaw(&session, scan.id_raw, tools.tools_list),
+                .tools_list => writeResultRaw(&session, scan.id_raw, Registry.tools_list),
                 .notif_initialized => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_roots_changed => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_cancelled => {},
 
                 // tools/call: scanner-based fast path (no std.json parse)
-                .tools_call => handleCall(&session, &scan),
+                .tools_call => handleCall(Registry, &session, &scan),
 
                 // initialize + logging/setLevel: scanner-based (no std.json parse)
-                .initialize => handleInitializeFast(&session, &scan),
+                .initialize => handleInitializeFast(Registry, &session, &scan),
                 .logging_setLevel => handleSetLogLevelFast(&session, &scan),
             } else {
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
@@ -163,6 +208,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io) void {
 }
 
 fn handleCall(
+    comptime Registry: type,
     s: *Session,
     scan: *const json.ScanResult,
 ) void {
@@ -181,13 +227,13 @@ fn handleCall(
     };
 
     // Dispatch
-    const tool = tools.parse(name) orelse {
+    const tool = Registry.parse(name) orelse {
         writeErrorRaw(s, id_raw, -32602, "Unknown tool"); return;
     };
 
     // Run handler into reusable tool_buf (clear, not free)
     s.tool_buf.clearRetainingCapacity();
-    tools.dispatchFast(alloc, s.io, tool, args_raw, &s.tool_buf);
+    Registry.dispatchFast(alloc, s.io, tool, args_raw, &s.tool_buf);
 
     // Build the complete JSON-RPC response directly into write_buf.
     const buf = &s.write_buf;
@@ -232,13 +278,11 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
     }
 
     // (#5) instructions + (#3) logging capability
-    writeResult(s, id,
-        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
-    );
+    writeResult(s, id, DEFAULT_INITIALIZE_RESULT);
 }
 
 /// Scanner-based initialize — no std.json parse needed.
-fn handleInitializeFast(s: *Session, scan: *const json.ScanResult) void {
+fn handleInitializeFast(comptime Registry: type, s: *Session, scan: *const json.ScanResult) void {
     if (scan.params_raw) |params_raw| {
         if (json.scanObj(params_raw, "capabilities")) |caps| {
             if (json.scanObj(caps, "roots")) |roots| {
@@ -247,9 +291,7 @@ fn handleInitializeFast(s: *Session, scan: *const json.ScanResult) void {
             }
         }
     }
-    writeResultRaw(s, scan.id_raw,
-        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
-    );
+    writeResultRaw(s, scan.id_raw, initializeResult(Registry));
 }
 
 // ── logging (#3) ───────────────────────────────────────────────────────────

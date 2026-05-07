@@ -7,7 +7,16 @@
 //   const Registry = mcp.registry.Registry;
 //   const wrapFn = mcp.registry.wrapFn;
 
-pub const mcp = @import("mcp.zig");
+const protocol = @import("mcp.zig");
+
+pub const mcp = protocol;
+pub const Server = protocol.Server;
+pub const run = protocol.run;
+pub const runWithRegistry = protocol.runWithRegistry;
+pub const validateRegistry = protocol.validateRegistry;
+pub const PROTOCOL_VERSION = protocol.PROTOCOL_VERSION;
+pub const DEFAULT_INITIALIZE_RESULT = protocol.DEFAULT_INITIALIZE_RESULT;
+
 pub const http = @import("http.zig");
 pub const json = @import("json.zig");
 pub const registry = @import("registry.zig");
