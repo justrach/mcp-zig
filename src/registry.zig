@@ -15,12 +15,82 @@ const json = @import("json.zig");
 /// Handler function signature for MCP tools.
 pub const Handler = *const fn (std.mem.Allocator, *const std.json.ObjectMap, *std.ArrayList(u8)) void;
 
+/// Default input schema for tools that take no arguments.
+pub const empty_input_schema = "{\"type\":\"object\",\"properties\":{},\"required\":[]}";
+
 /// A single tool definition.
+///
+/// Two styles are supported:
+///
+/// 1. Raw schema fragment (old/minimal style):
+///    `.schema = "{\"name\":...,\"inputSchema\":...}"`
+///
+/// 2. Library-style fields (new/composable style):
+///    `.description = "...", .input_schema = "{...}", .annotations = "{...}"`
+///
+/// The raw fields ending in `_schema`, `annotations`, `icons`, `execution`, and
+/// `meta` are JSON fragments. `name`, `title`, and `description` are escaped as
+/// JSON strings at comptime.
 pub const ToolDef = struct {
     name: []const u8,
     handler: Handler,
-    schema: []const u8, // JSON fragment: {"name":"...","description":"...","inputSchema":{...}}
+
+    /// Complete Tool JSON fragment. If set, this is used verbatim for
+    /// backwards compatibility and maximum control.
+    schema: ?[]const u8 = null,
+
+    /// Library-style fields used when `schema == null`.
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    input_schema: []const u8 = empty_input_schema,
+    output_schema: ?[]const u8 = null,
+    annotations: ?[]const u8 = null,
+    icons: ?[]const u8 = null,
+    execution: ?[]const u8 = null,
+    meta: ?[]const u8 = null,
 };
+
+fn jsonString(comptime s: []const u8) []const u8 {
+    comptime var out: []const u8 = "\"";
+    inline for (s) |c| {
+        switch (c) {
+            '"' => out = out ++ "\\\"",
+            '\\' => out = out ++ "\\\\",
+            '\n' => out = out ++ "\\n",
+            '\r' => out = out ++ "\\r",
+            '\t' => out = out ++ "\\t",
+            else => {
+                if (c < 0x20) @compileError("ToolDef strings cannot contain unescaped control characters");
+                out = out ++ &[_]u8{c};
+            },
+        }
+    }
+    return out ++ "\"";
+}
+
+/// Return the Tool JSON object for a definition.
+/// When `.schema` is supplied it is used verbatim; otherwise this builds the
+/// standard MCP Tool object from library-style fields.
+pub fn toolJson(comptime def: ToolDef) []const u8 {
+    if (def.schema) |raw| return raw;
+
+    comptime {
+        const desc = def.description orelse
+            @compileError("ToolDef " ++ def.name ++ " must set either .schema or .description");
+
+        var buf: []const u8 = "{\"name\":" ++ jsonString(def.name);
+        if (def.title) |title| buf = buf ++ ",\"title\":" ++ jsonString(title);
+        buf = buf ++ ",\"description\":" ++ jsonString(desc);
+        if (def.icons) |icons| buf = buf ++ ",\"icons\":" ++ icons;
+        buf = buf ++ ",\"inputSchema\":" ++ def.input_schema;
+        if (def.output_schema) |output_schema| buf = buf ++ ",\"outputSchema\":" ++ output_schema;
+        if (def.execution) |execution| buf = buf ++ ",\"execution\":" ++ execution;
+        if (def.annotations) |annotations| buf = buf ++ ",\"annotations\":" ++ annotations;
+        if (def.meta) |meta| buf = buf ++ ",\"_meta\":" ++ meta;
+        buf = buf ++ "}";
+        return buf;
+    }
+}
 
 /// Conventional tool-pack type for library authors.
 ///
@@ -90,7 +160,7 @@ pub fn Registry(comptime defs: []const ToolDef) type {
             var buf: []const u8 = "{\"tools\":[";
             for (defs, 0..) |def, i| {
                 if (i > 0) buf = buf ++ ",";
-                buf = buf ++ def.schema;
+                buf = buf ++ toolJson(def);
             }
             buf = buf ++ "]}";
             break :blk buf;
@@ -224,7 +294,7 @@ pub fn fromPacks(comptime packs: anytype) type {
                 for (defs) |def| {
                     if (!first) buf = buf ++ ",";
                     first = false;
-                    buf = buf ++ def.schema;
+                    buf = buf ++ toolJson(def);
                 }
             }
             buf = buf ++ "]}";
@@ -333,7 +403,7 @@ pub fn fromPackages(comptime packages: anytype) type {
                 for (defs) |def| {
                     if (!first) buf = buf ++ ",";
                     first = false;
-                    buf = buf ++ def.schema;
+                    buf = buf ++ toolJson(def);
                 }
             }
             buf = buf ++ "]}";
@@ -435,6 +505,66 @@ pub fn wrapFn(
             }
         }
     }.handler;
+}
+
+test "Registry builds tools/list from library-style ToolDef fields" {
+    const testing = std.testing;
+
+    const typed_input_schema =
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    ;
+    const typed_output_schema =
+        \\{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"]}
+    ;
+
+    const Tools = Registry(&.{.{
+        .name = "hello_tool",
+        .title = "Hello Tool",
+        .description = "Say \"hello\" to a user.\nReturns JSON.",
+        .handler = struct {
+            fn handler(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+                _ = args;
+                out.appendSlice(alloc, "{\"greeting\":\"hello\"}") catch {};
+            }
+        }.handler,
+        .input_schema = typed_input_schema,
+        .output_schema = typed_output_schema,
+        .annotations = "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}",
+        .icons = "[{\"src\":\"data:image/png;base64,AA==\",\"mimeType\":\"image/png\"}]",
+    }});
+
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"name\":\"hello_tool\"") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"title\":\"Hello Tool\"") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "Say \\\"hello\\\" to a user.\\nReturns JSON.") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"outputSchema\"") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"annotations\"") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"icons\"") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, Tools.tools_list, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "raw schema ToolDef remains backwards-compatible" {
+    const testing = std.testing;
+
+    const raw_schema =
+        \\{"name":"raw_tool","description":"Raw schema tool.","inputSchema":{"type":"object","properties":{},"required":[]}}
+    ;
+    const Tools = Registry(&.{.{
+        .name = "raw_tool",
+        .handler = struct {
+            fn handler(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+                _ = args;
+                out.appendSlice(alloc, "ok") catch {};
+            }
+        }.handler,
+        .schema = raw_schema,
+        .description = "ignored when schema is set",
+    }});
+
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, raw_schema) != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "ignored when schema is set") == null);
 }
 
 test "fromPackages composes package.mcp providers" {

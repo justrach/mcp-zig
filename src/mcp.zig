@@ -31,9 +31,20 @@ const json = @import("json.zig");
 const default_tools = @import("tools.zig");
 
 pub const PROTOCOL_VERSION = "2025-06-18";
-pub const DEFAULT_INITIALIZE_RESULT =
-    \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"logging":{}},"serverInfo":{"name":"mcp-zig","title":"MCP Zig Server","version":"1.0.0"},"instructions":"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries."}
-;
+
+/// Versions this implementation has been verified against, newest first.
+/// Keep this conservative: only add a version once the core lifecycle/transport
+/// behavior has been audited for that spec revision.
+pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+};
+
+const DEFAULT_INITIALIZE_RESULT_PREFIX = "{\"protocolVersion\":\"";
+const DEFAULT_INITIALIZE_RESULT_SUFFIX = "\",\"capabilities\":{\"tools\":{\"listChanged\":false},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-zig\",\"title\":\"MCP Zig Server\",\"version\":\"1.0.0\"},\"instructions\":\"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries.\"}";
+
+pub const DEFAULT_INITIALIZE_RESULT = DEFAULT_INITIALIZE_RESULT_PREFIX ++ PROTOCOL_VERSION ++ DEFAULT_INITIALIZE_RESULT_SUFFIX;
 
 /// Validate that a tool registry provides the server-facing API.
 pub fn validateRegistry(comptime Registry: type) void {
@@ -55,6 +66,45 @@ pub fn initializeResult(comptime Registry: type) []const u8 {
     validateRegistry(Registry);
     if (@hasDecl(Registry, "initialize_result")) return Registry.initialize_result;
     return DEFAULT_INITIALIZE_RESULT;
+}
+
+/// Pick the protocol version to send back in initialize.
+///
+/// If the client requested a known version, echo it back. If it requested a
+/// future date-like version, return our latest supported version. If it
+/// requested an older/unknown version, return our oldest supported version so
+/// older clients get the most compatible response shape.
+pub fn negotiateProtocolVersion(requested: ?[]const u8) []const u8 {
+    const req = requested orelse return PROTOCOL_VERSION;
+    if (req.len == 0) return PROTOCOL_VERSION;
+
+    for (SUPPORTED_PROTOCOL_VERSIONS) |v| {
+        if (std.mem.eql(u8, req, v)) return v;
+    }
+
+    if (std.mem.order(u8, req, SUPPORTED_PROTOCOL_VERSIONS[0]) == .gt) {
+        return SUPPORTED_PROTOCOL_VERSIONS[0];
+    }
+    return SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len - 1];
+}
+
+/// Build the default initialize result for a negotiated protocol version.
+/// Caller owns the returned slice.
+pub fn defaultInitializeResultForVersionAlloc(alloc: std.mem.Allocator, version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        DEFAULT_INITIALIZE_RESULT_PREFIX,
+        version,
+        DEFAULT_INITIALIZE_RESULT_SUFFIX,
+    });
+}
+
+/// Build the initialize result for a registry. Registries with a raw
+/// `initialize_result` keep full control and are returned verbatim; otherwise
+/// the default result is generated with the negotiated protocol version.
+pub fn initializeResultForVersionAlloc(comptime Registry: type, alloc: std.mem.Allocator, version: []const u8) ![]u8 {
+    validateRegistry(Registry);
+    if (@hasDecl(Registry, "initialize_result")) return alloc.dupe(u8, Registry.initialize_result);
+    return defaultInitializeResultForVersionAlloc(alloc, version);
 }
 
 // ── Log levels (RFC 5424 severity) ──────────────────────────────────────────
@@ -277,13 +327,24 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         }
     }
 
+    const requested_version = blk: {
+        const p = root.get("params") orelse break :blk null;
+        if (p != .object) break :blk null;
+        break :blk json.getStr(&p.object, "protocolVersion");
+    };
+    const negotiated = negotiateProtocolVersion(requested_version);
+    const init_result = defaultInitializeResultForVersionAlloc(s.alloc, negotiated) catch return;
+    defer s.alloc.free(init_result);
+
     // (#5) instructions + (#3) logging capability
-    writeResult(s, id, DEFAULT_INITIALIZE_RESULT);
+    writeResult(s, id, init_result);
 }
 
 /// Scanner-based initialize — no std.json parse needed.
 fn handleInitializeFast(comptime Registry: type, s: *Session, scan: *const json.ScanResult) void {
+    var requested_version: ?[]const u8 = null;
     if (scan.params_raw) |params_raw| {
+        requested_version = json.scanStr(params_raw, "protocolVersion");
         if (json.scanObj(params_raw, "capabilities")) |caps| {
             if (json.scanObj(caps, "roots")) |roots| {
                 s.client_supports_roots = true;
@@ -291,7 +352,10 @@ fn handleInitializeFast(comptime Registry: type, s: *Session, scan: *const json.
             }
         }
     }
-    writeResultRaw(s, scan.id_raw, initializeResult(Registry));
+    const negotiated = negotiateProtocolVersion(requested_version);
+    const init_result = initializeResultForVersionAlloc(Registry, s.alloc, negotiated) catch return;
+    defer s.alloc.free(init_result);
+    writeResultRaw(s, scan.id_raw, init_result);
 }
 
 // ── logging (#3) ───────────────────────────────────────────────────────────
@@ -583,4 +647,27 @@ fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Val
     } else {
         buf.appendSlice(alloc, "null") catch return;
     }
+}
+
+test "negotiateProtocolVersion echoes known versions" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("2025-06-18", negotiateProtocolVersion("2025-06-18"));
+    try testing.expectEqualStrings("2025-03-26", negotiateProtocolVersion("2025-03-26"));
+    try testing.expectEqualStrings("2024-11-05", negotiateProtocolVersion("2024-11-05"));
+}
+
+test "negotiateProtocolVersion handles absent and unknown versions" {
+    const testing = std.testing;
+    try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateProtocolVersion(null));
+    try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateProtocolVersion(""));
+    try testing.expectEqualStrings("2025-06-18", negotiateProtocolVersion("2025-11-25"));
+    try testing.expectEqualStrings("2024-11-05", negotiateProtocolVersion("2024-01-01"));
+}
+
+test "defaultInitializeResultForVersionAlloc uses negotiated version" {
+    const testing = std.testing;
+    const result = try defaultInitializeResultForVersionAlloc(testing.allocator, "2025-03-26");
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"protocolVersion\":\"2025-03-26\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"serverInfo\"") != null);
 }

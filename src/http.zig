@@ -20,12 +20,12 @@ pub const Options = struct {
 const SessionStore = struct {
     allocator: std.mem.Allocator,
     next_id: u64 = 1,
-    ids: std.StringHashMap(void),
+    ids: std.StringHashMap([]const u8),
 
     fn init(allocator: std.mem.Allocator) SessionStore {
         return .{
             .allocator = allocator,
-            .ids = std.StringHashMap(void).init(allocator),
+            .ids = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -37,7 +37,7 @@ const SessionStore = struct {
         self.ids.deinit();
     }
 
-    fn create(self: *SessionStore) ![]const u8 {
+    fn create(self: *SessionStore, protocol_version: []const u8) ![]const u8 {
         const id = try std.fmt.allocPrint(
             self.allocator,
             "mcp-zig-{d}",
@@ -45,8 +45,12 @@ const SessionStore = struct {
         );
         errdefer self.allocator.free(id);
         self.next_id += 1;
-        try self.ids.put(id, {});
+        try self.ids.put(id, protocol_version);
         return id;
+    }
+
+    fn getVersion(self: *SessionStore, id: []const u8) ?[]const u8 {
+        return self.ids.get(id);
     }
 
     fn contains(self: *SessionStore, id: []const u8) bool {
@@ -66,6 +70,7 @@ const Request = struct {
     method: []const u8,
     path: []const u8,
     session_id: ?[]const u8,
+    protocol_version: ?[]const u8,
     body: []const u8,
 };
 
@@ -153,7 +158,7 @@ fn handleConnection(
     if (body_end > request_buf.len) {
         var write_buf: [4096]u8 = undefined;
         var conn = Conn.init(io, stream, &write_buf);
-        respondJson(&conn, "413 Payload Too Large", "{\"error\":\"request too large\"}", null);
+        respondJson(&conn, "413 Payload Too Large", "{\"error\":\"request too large\"}", null, PROTOCOL_VERSION);
         return;
     }
     while (n < body_end) {
@@ -166,43 +171,53 @@ fn handleConnection(
     var conn = Conn.init(io, stream, &write_buf);
 
     const req = parseRequest(request_buf[0..n]) orelse {
-        respondJson(&conn, "400 Bad Request", "{\"error\":\"bad request\"}", null);
+        respondJson(&conn, "400 Bad Request", "{\"error\":\"bad request\"}", null, PROTOCOL_VERSION);
         return;
     };
 
     if (!std.mem.eql(u8, req.path, "/mcp")) {
-        respondJson(&conn, "404 Not Found", "{\"error\":\"not found\"}", null);
+        respondJson(&conn, "404 Not Found", "{\"error\":\"not found\"}", null, PROTOCOL_VERSION);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
-        respondEmpty(&conn, "204 No Content", null);
+        respondEmpty(&conn, "204 No Content", null, PROTOCOL_VERSION);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "GET")) {
         const session_id = req.session_id orelse {
-            respondJson(&conn, "400 Bad Request", "{\"error\":\"missing mcp-session-id\"}", null);
+            respondJson(&conn, "400 Bad Request", "{\"error\":\"missing mcp-session-id\"}", null, PROTOCOL_VERSION);
             return;
         };
-        if (!sessions.contains(session_id)) {
-            respondJson(&conn, "404 Not Found", "{\"error\":\"unknown mcp-session-id\"}", null);
+        const protocol_version = sessions.getVersion(session_id) orelse {
+            respondJson(&conn, "404 Not Found", "{\"error\":\"unknown mcp-session-id\"}", null, PROTOCOL_VERSION);
             return;
+        };
+        if (req.protocol_version) |header_version| {
+            if (!std.mem.eql(u8, header_version, protocol_version)) {
+                respondJson(&conn, "400 Bad Request", "{\"error\":\"mcp-protocol-version mismatch\"}", null, protocol_version);
+                return;
+            }
         }
-        respondSseUnavailable(&conn, session_id);
+        respondSseUnavailable(&conn, session_id, protocol_version);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "DELETE")) {
+        const protocol_version = if (req.session_id) |session_id|
+            sessions.getVersion(session_id) orelse PROTOCOL_VERSION
+        else
+            PROTOCOL_VERSION;
         if (req.session_id) |session_id| {
             _ = sessions.remove(session_id);
         }
-        respondEmpty(&conn, "204 No Content", null);
+        respondEmpty(&conn, "204 No Content", null, protocol_version);
         return;
     }
 
     if (!std.mem.eql(u8, req.method, "POST")) {
-        respondJson(&conn, "405 Method Not Allowed", "{\"error\":\"method not allowed\"}", null);
+        respondJson(&conn, "405 Method Not Allowed", "{\"error\":\"method not allowed\"}", null, PROTOCOL_VERSION);
         return;
     }
 
@@ -222,7 +237,7 @@ fn handlePost(
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
         appendRpcError(allocator, &body, null, -32700, "Parse error");
-        respondJson(conn, "400 Bad Request", body.items, null);
+        respondJson(conn, "400 Bad Request", body.items, null, PROTOCOL_VERSION);
         return;
     }
 
@@ -231,33 +246,49 @@ fn handlePost(
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
         appendRpcError(allocator, &body, scan.id_raw, -32600, "Missing method");
-        respondJson(conn, "200 OK", body.items, null);
+        respondJson(conn, "200 OK", body.items, null, PROTOCOL_VERSION);
         return;
     };
 
     if (std.mem.eql(u8, method, "initialize")) {
-        const session_id = sessions.create() catch {
-            respondJson(conn, "500 Internal Server Error", "{\"error\":\"session create failed\"}", null);
+        const requested_version = if (scan.params_raw) |params_raw|
+            json.scanStr(params_raw, "protocolVersion")
+        else
+            null;
+        const negotiated = protocol.negotiateProtocolVersion(requested_version);
+        const session_id = sessions.create(negotiated) catch {
+            respondJson(conn, "500 Internal Server Error", "{\"error\":\"session create failed\"}", null, PROTOCOL_VERSION);
             return;
         };
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(allocator);
-        appendRpcResultRaw(allocator, &body, scan.id_raw, protocol.initializeResult(Registry));
-        respondJson(conn, "200 OK", body.items, session_id);
+        const init_result = protocol.initializeResultForVersionAlloc(Registry, allocator, negotiated) catch {
+            respondJson(conn, "500 Internal Server Error", "{\"error\":\"initialize failed\"}", null, negotiated);
+            return;
+        };
+        defer allocator.free(init_result);
+        appendRpcResultRaw(allocator, &body, scan.id_raw, init_result);
+        respondJson(conn, "200 OK", body.items, session_id, negotiated);
         return;
     }
 
     const session_id = req.session_id orelse {
-        respondJson(conn, "400 Bad Request", "{\"error\":\"missing mcp-session-id\"}", null);
+        respondJson(conn, "400 Bad Request", "{\"error\":\"missing mcp-session-id\"}", null, PROTOCOL_VERSION);
         return;
     };
-    if (!sessions.contains(session_id)) {
-        respondJson(conn, "404 Not Found", "{\"error\":\"unknown mcp-session-id\"}", null);
+    const protocol_version = sessions.getVersion(session_id) orelse {
+        respondJson(conn, "404 Not Found", "{\"error\":\"unknown mcp-session-id\"}", null, PROTOCOL_VERSION);
         return;
+    };
+    if (req.protocol_version) |header_version| {
+        if (!std.mem.eql(u8, header_version, protocol_version)) {
+            respondJson(conn, "400 Bad Request", "{\"error\":\"mcp-protocol-version mismatch\"}", null, protocol_version);
+            return;
+        }
     }
 
     if (scan.id_raw == null) {
-        respondEmpty(conn, "202 Accepted", session_id);
+        respondEmpty(conn, "202 Accepted", session_id, protocol_version);
         return;
     }
 
@@ -276,7 +307,7 @@ fn handlePost(
         appendRpcError(allocator, &body, scan.id_raw, -32601, "Method not found");
     }
 
-    respondJson(conn, "200 OK", body.items, session_id);
+    respondJson(conn, "200 OK", body.items, session_id, protocol_version);
 }
 
 fn appendToolCallResult(
@@ -350,37 +381,37 @@ fn appendRpcError(
     body.appendSlice(allocator, "\"}}") catch return;
 }
 
-fn respondJson(conn: *Conn, status: []const u8, body: []const u8, session_id: ?[]const u8) void {
+fn respondJson(conn: *Conn, status: []const u8, body: []const u8, session_id: ?[]const u8, protocol_version: []const u8) void {
     var hdr_buf: [1024]u8 = undefined;
     const session_header = session_id orelse "";
     const hdr = if (session_id != null)
         std.fmt.bufPrint(
             &hdr_buf,
             "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nMcp-Protocol-Version: {s}\r\nMcp-Session-Id: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\nAccess-Control-Expose-Headers: Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\n\r\n",
-            .{ status, body.len, PROTOCOL_VERSION, session_header },
+            .{ status, body.len, protocol_version, session_header },
         ) catch return
     else
         std.fmt.bufPrint(
             &hdr_buf,
             "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nMcp-Protocol-Version: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\nAccess-Control-Expose-Headers: Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\n\r\n",
-            .{ status, body.len, PROTOCOL_VERSION },
+            .{ status, body.len, protocol_version },
         ) catch return;
     conn.writeAll(hdr);
     conn.writeAll(body);
     conn.flush();
 }
 
-fn respondEmpty(conn: *Conn, status: []const u8, session_id: ?[]const u8) void {
-    respondJson(conn, status, "", session_id);
+fn respondEmpty(conn: *Conn, status: []const u8, session_id: ?[]const u8, protocol_version: []const u8) void {
+    respondJson(conn, status, "", session_id, protocol_version);
 }
 
-fn respondSseUnavailable(conn: *Conn, session_id: []const u8) void {
+fn respondSseUnavailable(conn: *Conn, session_id: []const u8, protocol_version: []const u8) void {
     const body = "event: mcp-zig\r\ndata: {\"status\":\"sse-not-implemented\",\"message\":\"POST request/response JSON-RPC is available; resumable SSE is future work.\"}\r\n\r\n";
     var hdr_buf: [1024]u8 = undefined;
     const hdr = std.fmt.bufPrint(
         &hdr_buf,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\nMcp-Protocol-Version: {s}\r\nMcp-Session-Id: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\nAccess-Control-Expose-Headers: Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\n\r\n",
-        .{ body.len, PROTOCOL_VERSION, session_id },
+        .{ body.len, protocol_version, session_id },
     ) catch return;
     conn.writeAll(hdr);
     conn.writeAll(body);
@@ -411,6 +442,7 @@ fn parseRequest(raw: []const u8) ?Request {
         .method = method,
         .path = path,
         .session_id = headerValue(headers, "Mcp-Session-Id"),
+        .protocol_version = headerValue(headers, "Mcp-Protocol-Version"),
         .body = body,
     };
 }

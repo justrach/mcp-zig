@@ -234,6 +234,24 @@ const my_tools = registry.Registry(&.{
 // my_tools.tools_list           → combined JSON
 ```
 
+You can also define tools in a more library-like typed style instead of hand-writing the whole Tool JSON object. `schema` remains supported as a raw escape hatch, but new packages can compose metadata fields directly:
+
+```zig
+const my_tools = registry.Registry(&.{.{
+    .name = "greet",
+    .title = "Greet",
+    .description = "Return a greeting for a name.",
+    .handler = registry.wrapFn(greet, &.{"name"}),
+    .input_schema =
+        \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    ,
+    .output_schema =
+        \\{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"]}
+    ,
+    .annotations = "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}",
+}});
+```
+
 ### wrapFn — zero-boilerplate handlers
 
 Write a normal Zig function and `wrapFn` generates the MCP handler at comptime:
@@ -415,7 +433,7 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 
 ## Protocol notes
 
-**Protocol version: 2025-06-18** ([spec](https://spec.modelcontextprotocol.io))
+**Protocol version: 2025-06-18** ([spec](https://spec.modelcontextprotocol.io)). The server now negotiates conservatively: it echoes known client versions (`2025-06-18`, `2025-03-26`, `2024-11-05`), falls back to the newest supported version for future requests, and keeps older clients on the oldest compatible version.
 
 MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per line, no Content-Length headers (unlike LSP). The critical invariant: every write to stdout is exactly one JSON object followed by `\n`.
 
