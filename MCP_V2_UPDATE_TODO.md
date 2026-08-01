@@ -1,5 +1,25 @@
 # MCP v2 / newer-spec update TODO for mcp-zig
 
+> ## ⚠️ 2026-08 status correction (supersedes parts of this doc)
+>
+> - **Target spec is now `2026-07-28` ("Modern")**, not `2025-11-25`. Verified against the official schema at `modelcontextprotocol/modelcontextprotocol/schema/2026-07-28/schema.json`: `server/discover`, `UnsupportedProtocolVersion`, `inputRequests`/`inputResponses` (MRTR), `_meta`-carried `io.modelcontextprotocol/protocolVersion`, and `subscriptions/listen` all exist; **`initialize` is gone** (stateless protocol). `2025-11-25` and earlier are "Legacy".
+> - **Toolchain: repo now builds on zig `0.17.0-dev`** (`build.zig.zon` floor bumped; `b.args` removed — the runner appends `--` args itself; `std.meta.fields` → `std.meta.stringToEnum`; `io.vtable.netRead` → `Stream.read`). zig 0.16 is no longer supported.
+> - **Stale sections below**: "Add SUPPORTED_PROTOCOL_VERSIONS + negotiation" is **done** (`src/mcp.zig:38-42,77-91`). Registry `ToolDef` title/icons/annotations/outputSchema/execution is **done** (`src/registry.zig:34-51`). "Richer initialize result", per-session versions, and SSE resumability are **superseded** by the stateless model — do not build them as written.
+> - **Critical path for 2026-07-28** (from a full gap audit, file:line verified):
+>   1. Request-level `_meta` parsing — none exists (`src/json.zig:48-54` `ScanResult` has no `_meta`); everything (version, client caps/info, per-request log level, MRTR `inputResponses`) flows through it. **Foundation.**
+>   2. `server/discover` RPC + `UnsupportedProtocolVersionError` (replaces echo/clamp negotiation in modern mode).
+>   3. Dual-mode: stateless "modern" dispatch path alongside retained legacy session path (downstream codedb uses legacy).
+>   4. Modern mode: drop `ping`/`logging/setLevel`/`notifications/roots/list_changed`; per-request `_meta` logLevel.
+>   5. Cheap 2025-11-25 leftovers: annotations on built-in tools (`src/tools.zig:30-37`), `isError:true` on tool failure, mandatory version header + Origin 403 on HTTP.
+>   6. HTTP modern transport: delete `SessionStore`/session-id gates (`src/http.zig:20-67,251-287`), require `Mcp-Method`/`Mcp-Name`, version header must match `_meta`; then `subscriptions/listen` long-lived POST (needs breaking the one-request-per-connection model, `src/http.zig:137,388-389`).
+>   7. MRTR or explicit-args shortcut for roots (roots deprecated in 2026-07-28 — explicit args is the cheaper compliant path).
+>   8. `x-mcp-header` + Handler context (ripples to downstream codedb); `extensions` capability; `ttlMs`/`cacheScope`.
+>   9. Legacy SSE resumability — last, only if legacy demand justifies.
+>
+> The original doc follows for reference/history.
+
+---
+
 This checklist captures what changed upstream after the current `mcp-zig` baseline and what we likely need to do to upgrade cleanly.
 
 ## Current baseline in this repo
