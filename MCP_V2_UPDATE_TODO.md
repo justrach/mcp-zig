@@ -10,10 +10,16 @@
 > stateless modern HTTP with `Mcp-Method`/`Mcp-Name` validation and 404 for
 > unknown methods, `subscriptions/listen` SSE with keep-alives,
 > `resultType`/`ttlMs`/`cacheScope` on modern results, capabilities
-> `extensions`, MRTR shortcut (explicit-args roots; modern mode never
-> server-initiates). Remaining gaps: full MRTR (`inputRequests` results),
-> resources/prompts/completions, legacy-mode SSE resumability, and
-> `src/client.zig` speaks legacy only.
+> `extensions` (registry-aware: resources/prompts/completions advertised only
+> when the registry provides the decls), first-class resources/prompts/
+> completions (optional `resources_list`/`prompts_list` fragments +
+> `readResourceFast`/`getPromptFast`/`completeFast` hooks on both transports),
+> MRTR plumbing (`dispatchFastRaw` owns full results incl. `inputRequired` +
+> `inputRequests`; `params._meta` `inputResponses` forwarded for correlation),
+> modern client mode (`McpClient.useModern` — stateless discover/listTools/
+> callTool), and legacy-mode SSE (GET /mcp opens a real keep-alive stream;
+> `Last-Event-ID` accepted — replay is a documented no-op since this server
+> has no notification sources).
 >
 > - **Target spec is now `2026-07-28` ("Modern")**, not `2025-11-25`. Verified against the official schema at `modelcontextprotocol/modelcontextprotocol/schema/2026-07-28/schema.json`: `server/discover`, `UnsupportedProtocolVersion`, `inputRequests`/`inputResponses` (MRTR), `_meta`-carried `io.modelcontextprotocol/protocolVersion`, and `subscriptions/listen` all exist; **`initialize` is gone** (stateless protocol). `2025-11-25` and earlier are "Legacy".
 > - **Toolchain: repo now builds on zig `0.17.0-dev`** (`build.zig.zon` floor bumped; `b.args` removed — the runner appends `--` args itself; `std.meta.fields` → `std.meta.stringToEnum`; `io.vtable.netRead` → `Stream.read`). zig 0.16 is no longer supported.
