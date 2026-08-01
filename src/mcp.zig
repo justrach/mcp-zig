@@ -121,10 +121,7 @@ pub const LogLevel = enum {
 };
 
 fn logLevelFromString(s: []const u8) ?LogLevel {
-    inline for (std.meta.fields(LogLevel)) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-    }
-    return null;
+    return std.meta.stringToEnum(LogLevel, s);
 }
 
 /// Workspace root provided by the client via the roots capability.

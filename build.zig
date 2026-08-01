@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     // zig build run — start the server (useful for manual smoke-testing)
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |a| for (a) |arg| run_cmd.addArg(arg);
+    // 0.17: args after `--` are appended to run steps by the build runner itself.
     const run_step = b.step("run", "Run the MCP server");
     run_step.dependOn(&run_cmd.step);
 
@@ -61,7 +61,6 @@ pub fn build(b: *std.Build) void {
     // zig build run-client -- /path/to/server
     const run_client = b.addRunArtifact(client_exe);
     run_client.step.dependOn(b.getInstallStep());
-    if (b.args) |a| for (a) |arg| run_client.addArg(arg);
     const run_client_step = b.step("run-client", "Run the MCP client example");
     run_client_step.dependOn(&run_client.step);
 

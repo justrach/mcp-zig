@@ -129,7 +129,7 @@ pub fn serveWithRegistry(io: std.Io, allocator: std.mem.Allocator, opts: Options
 fn readSome(io: std.Io, stream: std.Io.net.Stream, dest: []u8) !usize {
     if (dest.len == 0) return 0;
     var iov: [1][]u8 = .{dest};
-    return try io.vtable.netRead(io.userdata, stream.socket.handle, &iov);
+    return try stream.read(io, &iov);
 }
 
 fn handleConnection(
