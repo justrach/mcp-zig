@@ -2,12 +2,18 @@
 
 > ## ⚠️ 2026-08 status correction (supersedes parts of this doc)
 >
-> **Progress: phases 1, 2, and 5 below are DONE** (stdio + HTTP, smoke-tested):
-> `_meta` parsing + serverInfo stamping, `server/discover` +
-> UnsupportedProtocolVersionError (-32022), per-request log level, tool
-> annotations, `isError`, mandatory version header, Origin 403. Remaining:
-> phases 3-4 (dual-mode/stateless dispatch), 6 (HTTP session teardown +
-> subscriptions/listen), 7 (MRTR), 8 (x-mcp-header/extensions/caching).
+> **Progress: phases 1-8 below are DONE** (stdio + HTTP, smoke-tested):
+> `_meta` parsing + serverInfo stamping, `server/discover`,
+> UnsupportedProtocolVersionError (-32022) + HeaderMismatch (-32020),
+> per-request log level, tool annotations, `isError`, mandatory version
+> header, Origin 403, modern dual-mode dispatch (removed methods → -32601),
+> stateless modern HTTP with `Mcp-Method`/`Mcp-Name` validation and 404 for
+> unknown methods, `subscriptions/listen` SSE with keep-alives,
+> `resultType`/`ttlMs`/`cacheScope` on modern results, capabilities
+> `extensions`, MRTR shortcut (explicit-args roots; modern mode never
+> server-initiates). Remaining gaps: full MRTR (`inputRequests` results),
+> resources/prompts/completions, legacy-mode SSE resumability, and
+> `src/client.zig` speaks legacy only.
 >
 > - **Target spec is now `2026-07-28` ("Modern")**, not `2025-11-25`. Verified against the official schema at `modelcontextprotocol/modelcontextprotocol/schema/2026-07-28/schema.json`: `server/discover`, `UnsupportedProtocolVersion`, `inputRequests`/`inputResponses` (MRTR), `_meta`-carried `io.modelcontextprotocol/protocolVersion`, and `subscriptions/listen` all exist; **`initialize` is gone** (stateless protocol). `2025-11-25` and earlier are "Legacy".
 > - **Toolchain: repo now builds on zig `0.17.0-dev`** (`build.zig.zon` floor bumped; `b.args` removed — the runner appends `--` args itself; `std.meta.fields` → `std.meta.stringToEnum`; `io.vtable.netRead` → `Stream.read`). zig 0.16 is no longer supported.

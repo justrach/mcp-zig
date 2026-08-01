@@ -433,7 +433,12 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 
 ## Protocol notes
 
-**Protocol version: 2025-06-18** ([spec](https://spec.modelcontextprotocol.io)). The server now negotiates conservatively: it echoes known client versions (`2025-06-18`, `2025-03-26`, `2024-11-05`), falls back to the newest supported version for future requests, and keeps older clients on the oldest compatible version.
+**Protocol versions: `2026-07-28` (modern/stateless) + `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` (legacy)** ([spec](https://spec.modelcontextprotocol.io)). The server is dual-mode:
+
+- **Modern (`2026-07-28`)**: requests self-describe via `params._meta."io.modelcontextprotocol/protocolVersion"` — no `initialize` handshake (it and `ping`/`logging/setLevel`/`notifications/roots/list_changed` answer `-32601` for modern callers). `server/discover` advertises versions/capabilities; every modern result is stamped with `_meta."io.modelcontextprotocol/serverInfo"`; unknown modern versions get `UnsupportedProtocolVersionError` (`-32020` is `HeaderMismatch`, `-32022` unsupported version). Over HTTP, modern POSTs need no session but must mirror `MCP-Protocol-Version`/`Mcp-Method`(/`Mcp-Name`) headers; unknown methods are `404` + `-32601`; `subscriptions/listen` returns a long-lived SSE stream (keep-alive comment lines, `X-Accel-Buffering: no`).
+- **Legacy**: the initialize handshake negotiates conservatively (echo known versions, clamp future to newest legacy `2025-11-25`, oldest for unknown-old), with sessions over HTTP exactly as before.
+
+MRTR note: server-initiated requests (`roots/list` et al.) are legacy-only. Modern clients pass roots/project context as explicit tool arguments; `inputResponses` in `_meta` are accepted (and unused, since this server never returns `inputRequests`).
 
 MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per line, no Content-Length headers (unlike LSP). The critical invariant: every write to stdout is exactly one JSON object followed by `\n`.
 
