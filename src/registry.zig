@@ -31,6 +31,12 @@ pub const empty_input_schema = "{\"type\":\"object\",\"properties\":{},\"require
 /// The raw fields ending in `_schema`, `annotations`, `icons`, `execution`, and
 /// `meta` are JSON fragments. `name`, `title`, and `description` are escaped as
 /// JSON strings at comptime.
+///
+/// 2026-07-28 note: parameter-level `x-mcp-header` extension properties (which
+/// make conforming clients mirror argument values into `Mcp-Param-{Name}`
+/// request headers) can be declared directly inside `schema`/`input_schema`
+/// JSON — both are passed through verbatim. The built-in tools declare none,
+/// so no `Mcp-Param-*` header validation is required of this server.
 pub const ToolDef = struct {
     name: []const u8,
     handler: Handler,

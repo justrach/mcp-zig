@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .single_threaded = !evented_enabled, // evented backend requires threaded runtime support
+            .single_threaded = false, // subscriptions/listen keep-alive uses a detached thread
             .strip = true, // smaller binary, faster page-in
         }),
     });

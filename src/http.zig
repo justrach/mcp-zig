@@ -71,6 +71,8 @@ const Request = struct {
     path: []const u8,
     session_id: ?[]const u8,
     protocol_version: ?[]const u8,
+    mcp_method: ?[]const u8,
+    mcp_name: ?[]const u8,
     origin: ?[]const u8,
     host: ?[]const u8,
     body: []const u8,
@@ -123,8 +125,9 @@ pub fn serveWithRegistry(io: std.Io, allocator: std.mem.Allocator, opts: Options
             error.WouldBlock, error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(Registry, io, allocator, stream, &sessions);
-        stream.close(io);
+        var detached = false;
+        handleConnection(Registry, io, allocator, stream, &sessions, &detached);
+        if (!detached) stream.close(io);
     }
 }
 
@@ -140,6 +143,7 @@ fn handleConnection(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     sessions: *SessionStore,
+    detached: *bool,
 ) void {
     const request_buf = allocator.alloc(u8, MAX_REQUEST_BYTES) catch return;
     defer allocator.free(request_buf);
@@ -230,7 +234,7 @@ fn handleConnection(
         return;
     }
 
-    handlePost(Registry, allocator, io, &conn, sessions, req);
+    handlePost(Registry, allocator, io, &conn, sessions, req, detached);
 }
 
 fn handlePost(
@@ -240,6 +244,7 @@ fn handlePost(
     conn: *Conn,
     sessions: *SessionStore,
     req: Request,
+    detached: *bool,
 ) void {
     const input = std.mem.trim(u8, req.body, " \t\r\n");
     if (input.len == 0) {
@@ -286,6 +291,13 @@ fn handlePost(
         defer body.deinit(allocator);
         appendRpcResultRawMeta(allocator, &body, scan.id_raw, protocol.discoverResult(Registry), true);
         respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+        return;
+    }
+
+    // Modern (2026-07-28) requests are self-describing: dispatch statelessly,
+    // no session gate. Legacy requests continue below.
+    if (modern) {
+        handleModernPost(Registry, allocator, io, conn, req, method, &scan, detached);
         return;
     }
 
@@ -353,6 +365,177 @@ fn handlePost(
     respondJson(conn, "200 OK", body.items, session_id, protocol_version);
 }
 
+// ── Modern (2026-07-28) stateless request path ─────────────────────────────
+//
+// Self-describing requests (those carrying _meta.protocolVersion) are
+// dispatched here with no session and no initialize. Mirrored request-metadata
+// headers are validated per the Streamable HTTP spec.
+
+/// HeaderMismatch (-32020): a mirrored header is missing or disagrees with the body.
+fn appendHeaderMismatch(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    id_raw: ?[]const u8,
+    detail: []const u8,
+) void {
+    body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    body.appendSlice(allocator, id_raw orelse "null") catch return;
+    body.appendSlice(allocator, ",\"error\":{\"code\":-32020,\"message\":\"Header mismatch: ") catch return;
+    json.writeEscaped(allocator, body, detail);
+    body.appendSlice(allocator, "\"}}") catch return;
+}
+
+fn headerMismatch(allocator: std.mem.Allocator, conn: *Conn, id_raw: ?[]const u8, detail: []const u8) void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    appendHeaderMismatch(allocator, &body, id_raw, detail);
+    respondJson(conn, "400 Bad Request", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+}
+
+fn handleModernPost(
+    comptime Registry: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    conn: *Conn,
+    req: Request,
+    method: []const u8,
+    scan: *const json.ScanResult,
+    detached: *bool,
+) void {
+    // Mirrored headers are REQUIRED on requests; notification POST header
+    // requirements are undefined by this revision, so they are skipped.
+    if (scan.id_raw != null) {
+        if (req.protocol_version == null) {
+            headerMismatch(allocator, conn, scan.id_raw, "missing MCP-Protocol-Version header");
+            return;
+        }
+        const hm = req.mcp_method orelse {
+            headerMismatch(allocator, conn, scan.id_raw, "missing Mcp-Method header");
+            return;
+        };
+        if (!std.mem.eql(u8, hm, method)) {
+            headerMismatch(allocator, conn, scan.id_raw, "Mcp-Method does not match body method");
+            return;
+        }
+        if (std.mem.eql(u8, method, "tools/call")) {
+            const name = if (scan.params_raw) |p| json.scanStr(p, "name") orelse "" else "";
+            const hn = req.mcp_name orelse {
+                headerMismatch(allocator, conn, scan.id_raw, "missing Mcp-Name header");
+                return;
+            };
+            if (!std.mem.eql(u8, hn, name)) {
+                headerMismatch(allocator, conn, scan.id_raw, "Mcp-Name does not match params.name");
+                return;
+            }
+        }
+    }
+
+    // Notifications: accept, no body.
+    if (scan.id_raw == null) {
+        respondEmpty(conn, "202 Accepted", null, protocol.MODERN_PROTOCOL_VERSION);
+        return;
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
+    if (std.mem.eql(u8, method, "tools/list")) {
+        // 2026-07-28 ListToolsResult requires resultType, ttlMs, cacheScope.
+        body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+        body.appendSlice(allocator, scan.id_raw orelse "null") catch return;
+        body.appendSlice(allocator, ",\"result\":{" ++ protocol.MODERN_RESULT_META ++ ",\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
+        body.appendSlice(allocator, Registry.tools_list[1..]) catch return;
+        body.appendSlice(allocator, "}") catch return;
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "tools/call")) {
+        appendToolCallResult(Registry, allocator, io, &body, scan, true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "server/discover")) {
+        appendRpcResultRawMeta(allocator, &body, scan.id_raw, protocol.discoverResult(Registry), true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "subscriptions/listen")) {
+        handleSubscriptionsListen(allocator, conn, scan, detached);
+    } else {
+        // Modern endpoint: unknown methods are 404 + -32601, distinguishable
+        // from a legacy HTTP+SSE server's bare 404.
+        appendRpcError(allocator, &body, scan.id_raw, -32601, "Method not found");
+        respondJson(conn, "404 Not Found", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    }
+}
+
+const ListenCtx = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    alloc: std.mem.Allocator,
+};
+
+/// Keep-alive for a subscriptions/listen SSE stream: an SSE comment line every
+/// 15s (spec-encouraged) until the client disconnects — closing the stream is
+/// itself the cancellation signal — then release the connection.
+fn listenKeepAlive(ctx: *ListenCtx) void {
+    defer {
+        ctx.stream.close(ctx.io);
+        ctx.alloc.destroy(ctx);
+    }
+    // Writer + buffer live on this thread's frame — safe after handleConnection returns.
+    var buf: [64]u8 = undefined;
+    var w = ctx.stream.writer(ctx.io, &buf);
+    while (true) {
+        std.Io.sleep(ctx.io, .fromSeconds(15), .awake) catch break;
+        w.interface.writeAll(":\r\n") catch break;
+        w.interface.flush() catch break;
+    }
+}
+
+/// subscriptions/listen: the response is a long-lived SSE stream delivering
+/// the opted-in change notifications. This server has no listChanged/update
+/// sources, so after the initial result event only keep-alive comments flow —
+/// trivially satisfying "MUST NOT send unrequested notification types".
+fn handleSubscriptionsListen(
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    scan: *const json.ScanResult,
+    detached: *bool,
+) void {
+    const params_raw = scan.params_raw orelse {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        appendRpcError(allocator, &body, scan.id_raw, -32602, "Missing params");
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+        return;
+    };
+    if (json.scanObj(params_raw, "notifications") == null) {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        appendRpcError(allocator, &body, scan.id_raw, -32602, "Missing notifications filter");
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+        return;
+    }
+
+    // SSE headers: indefinite (close-delimited) body, buffering disabled.
+    conn.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nMcp-Protocol-Version: " ++ protocol.MODERN_PROTOCOL_VERSION ++ "\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+
+    // Initial result event (SubscriptionsListenResult requires _meta + resultType).
+    var ev: std.ArrayList(u8) = .empty;
+    defer ev.deinit(allocator);
+    ev.appendSlice(allocator, "data: {\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    ev.appendSlice(allocator, scan.id_raw orelse "null") catch return;
+    ev.appendSlice(allocator, ",\"result\":{" ++ protocol.MODERN_RESULT_META ++ ",\"resultType\":\"complete\"}}\r\n\r\n") catch return;
+    conn.writeAll(ev.items);
+    conn.flush();
+
+    // Hand the connection to a detached keep-alive thread; the accept loop
+    // must NOT close the stream on return.
+    const ctx = allocator.create(ListenCtx) catch return;
+    ctx.* = .{ .io = conn.io, .stream = conn.stream, .alloc = allocator };
+    const t = std.Thread.spawn(.{}, listenKeepAlive, .{ctx}) catch {
+        allocator.destroy(ctx);
+        return;
+    };
+    t.detach();
+    detached.* = true;
+}
+
 fn appendToolCallResult(
     comptime Registry: type,
     allocator: std.mem.Allocator,
@@ -398,7 +581,8 @@ fn appendToolCallResult(
         body.appendSlice(allocator, tool_buf.items) catch return;
     }
     if (modern) {
-        body.appendSlice(allocator, "," ++ protocol.MODERN_RESULT_META) catch return;
+        // 2026-07-28 CallToolResult requires resultType.
+        body.appendSlice(allocator, ",\"resultType\":\"complete\"," ++ protocol.MODERN_RESULT_META) catch return;
     }
     body.appendSlice(allocator, "}}") catch return;
 }
@@ -534,6 +718,8 @@ fn parseRequest(raw: []const u8) ?Request {
         .path = path,
         .session_id = headerValue(headers, "Mcp-Session-Id"),
         .protocol_version = headerValue(headers, "Mcp-Protocol-Version"),
+        .mcp_method = headerValue(headers, "Mcp-Method"),
+        .mcp_name = headerValue(headers, "Mcp-Name"),
         .origin = headerValue(headers, "Origin"),
         .host = headerValue(headers, "Host"),
         .body = body,

@@ -63,6 +63,9 @@ pub const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
 
 const DEFAULT_SERVER_INFO_OBJ = "{\"name\":\"mcp-zig\",\"title\":\"MCP Zig Server\",\"version\":\"1.0.0\"}";
 const DEFAULT_CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
+/// 2026-07-28 ServerCapabilities adds the `extensions` field (empty: this
+/// server implements no extensions, e.g. io.modelcontextprotocol/tasks).
+const MODERN_CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{},\"extensions\":{}}";
 const DEFAULT_INSTRUCTIONS_TEXT = "MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries.";
 
 /// `_meta` envelope stamped as the first key of every result for modern
@@ -86,7 +89,7 @@ pub const SUPPORTED_VERSIONS_JSON = buildSupportedVersionsJson();
 /// Default `server/discover` result (2026-07-28 DiscoverResult). Stateless:
 /// requires no session and no initialize handshake. Registries may override
 /// with `pub const discover_result = "{...}"`.
-pub const DISCOVER_RESULT = "{\"resultType\":\"complete\",\"supportedVersions\":" ++ SUPPORTED_VERSIONS_JSON ++ ",\"capabilities\":" ++ DEFAULT_CAPABILITIES_JSON ++ ",\"ttlMs\":300000,\"cacheScope\":\"public\",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
+pub const DISCOVER_RESULT = "{\"resultType\":\"complete\",\"supportedVersions\":" ++ SUPPORTED_VERSIONS_JSON ++ ",\"capabilities\":" ++ MODERN_CAPABILITIES_JSON ++ ",\"ttlMs\":300000,\"cacheScope\":\"public\",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
 
 /// Discover result for a registry: `discover_result` override wins, else default.
 pub fn discoverResult(comptime Registry: type) []const u8 {
@@ -269,7 +272,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
 
     // Comptime perfect-hash method dispatch table — O(1) lookup, no sequential string comparisons.
-    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled, server_discover };
+    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled, server_discover, subscriptions_listen };
     const method_map = std.StaticStringMap(Method).initComptime(.{
         .{ "ping", .ping },
         .{ "tools/list", .tools_list },
@@ -280,6 +283,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         .{ "notifications/roots/list_changed", .notif_roots_changed },
         .{ "notifications/cancelled", .notif_cancelled },
         .{ "server/discover", .server_discover },
+        .{ "subscriptions/listen", .subscriptions_listen },
     });
 
     while (true) {
@@ -307,10 +311,25 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         }
 
         if (scan.method) |method| {
+            // 2026-07-28 removes the handshake and these utilities; modern
+            // callers get method-not-found (all remain for legacy clients).
+            if (session.stamp_meta) {
+                const modern_removed = std.StaticStringMap(void).initComptime(.{
+                    .{ "initialize", {} },
+                    .{ "notifications/initialized", {} },
+                    .{ "ping", {} },
+                    .{ "logging/setLevel", {} },
+                    .{ "notifications/roots/list_changed", {} },
+                });
+                if (modern_removed.has(method)) {
+                    if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
+                    continue;
+                }
+            }
             if (method_map.get(method)) |m| switch (m) {
                 // Fast path: no JSON parse needed — zero allocations
                 .ping => writeResultRaw(&session, scan.id_raw, "{}"),
-                .tools_list => writeResultRaw(&session, scan.id_raw, Registry.tools_list),
+                .tools_list => writeToolsListResult(Registry, &session, scan.id_raw),
                 .notif_initialized => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_roots_changed => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_cancelled => {},
@@ -326,6 +345,21 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
                 .server_discover => {
                     session.stamp_meta = true;
                     writeResultRaw(&session, scan.id_raw, discoverResult(Registry));
+                },
+
+                // 2026-07-28: opt-in notification stream. This server has no
+                // listChanged/update sources, so the acknowledged filter is
+                // stored implicitly (no notifications are ever emitted — which
+                // trivially satisfies "MUST NOT send unrequested types").
+                .subscriptions_listen => {
+                    const params_raw = scan.params_raw orelse {
+                        writeErrorRaw(&session, scan.id_raw, -32602, "Missing params"); continue;
+                    };
+                    if (json.scanObj(params_raw, "notifications") == null) {
+                        writeErrorRaw(&session, scan.id_raw, -32602, "Missing notifications filter"); continue;
+                    }
+                    session.stamp_meta = true; // SubscriptionsListenResult requires _meta
+                    writeResultRaw(&session, scan.id_raw, "{\"resultType\":\"complete\"}");
                 },
             } else {
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
@@ -398,7 +432,8 @@ fn handleCall(
     }
 
     if (s.stamp_meta) {
-        buf.appendSlice(alloc, "," ++ MODERN_RESULT_META) catch return;
+        // 2026-07-28 CallToolResult requires resultType.
+        buf.appendSlice(alloc, ",\"resultType\":\"complete\"," ++ MODERN_RESULT_META) catch return;
     }
 
     buf.appendSlice(alloc, "}}\n") catch return;
@@ -629,6 +664,26 @@ fn writeResultRaw(s: *Session, id_raw: ?[]const u8, result: []const u8) void {
     buf.appendSlice(alloc, id_raw orelse "null") catch return;
     buf.appendSlice(alloc, ",\"result\":") catch return;
     appendResultValue(alloc, buf, result, s.stamp_meta);
+    buf.appendSlice(alloc, "}\n") catch return;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
+}
+
+/// tools/list result. Modern (2026-07-28) ListToolsResult additionally
+/// requires `resultType`, `ttlMs`, and `cacheScope` — injected here alongside
+/// the `_meta` serverInfo envelope. Legacy responses are byte-identical.
+fn writeToolsListResult(comptime Registry: type, s: *Session, id_raw: ?[]const u8) void {
+    if (!s.stamp_meta) {
+        writeResultRaw(s, id_raw, Registry.tools_list);
+        return;
+    }
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"result\":{" ++ MODERN_RESULT_META ++ ",\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
+    // Registry.tools_list is '{"tools":[...]}' — splice in after the '{'.
+    appendStrippingNewlines(alloc, buf, Registry.tools_list[1..]);
     buf.appendSlice(alloc, "}\n") catch return;
     s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
