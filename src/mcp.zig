@@ -61,6 +61,33 @@ pub const LEGACY_PROTOCOL_VERSIONS = [_][]const u8{
 /// JSON-RPC error code for the 2026-07-28 UnsupportedProtocolVersionError.
 pub const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
 
+/// Capabilities for a registry, comptime-built: tools+logging always;
+/// resources/prompts/completions advertised ONLY when the registry provides
+/// the matching optional decls (resources_list / prompts_list / completeFast).
+fn capabilitiesJson(comptime Registry: type) []const u8 {
+    comptime {
+        var caps: []const u8 = "{\"tools\":{\"listChanged\":false},\"logging\":{}";
+        if (@hasDecl(Registry, "resources_list")) caps = caps ++ ",\"resources\":{\"listChanged\":false,\"subscribe\":false}";
+        if (@hasDecl(Registry, "prompts_list")) caps = caps ++ ",\"prompts\":{\"listChanged\":false}";
+        if (@hasDecl(Registry, "completeFast")) caps = caps ++ ",\"completions\":{}";
+        return caps ++ "}";
+    }
+}
+
+/// 2026-07-28 capabilities: legacy set plus `extensions` (empty — this server
+/// implements no extensions, e.g. io.modelcontextprotocol/tasks).
+fn modernCapabilitiesJson(comptime Registry: type) []const u8 {
+    comptime {
+        const caps = capabilitiesJson(Registry);
+        // insert extensions before the closing brace
+        return caps[0 .. caps.len - 1] ++ ",\"extensions\":{}}";
+    }
+}
+
+fn initializeSuffix(comptime Registry: type) []const u8 {
+    return "\",\"capabilities\":" ++ capabilitiesJson(Registry) ++ ",\"serverInfo\":" ++ DEFAULT_SERVER_INFO_OBJ ++ ",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
+}
+
 const DEFAULT_SERVER_INFO_OBJ = "{\"name\":\"mcp-zig\",\"title\":\"MCP Zig Server\",\"version\":\"1.0.0\"}";
 const DEFAULT_CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
 /// 2026-07-28 ServerCapabilities adds the `extensions` field (empty: this
@@ -95,7 +122,7 @@ pub const DISCOVER_RESULT = "{\"resultType\":\"complete\",\"supportedVersions\":
 pub fn discoverResult(comptime Registry: type) []const u8 {
     validateRegistry(Registry);
     if (@hasDecl(Registry, "discover_result")) return Registry.discover_result;
-    return DISCOVER_RESULT;
+    return "{\"resultType\":\"complete\",\"supportedVersions\":" ++ SUPPORTED_VERSIONS_JSON ++ ",\"capabilities\":" ++ comptime modernCapabilitiesJson(Registry) ++ ",\"ttlMs\":300000,\"cacheScope\":\"public\",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
 }
 
 /// Membership check for modern per-request `_meta` protocol versions.
@@ -153,13 +180,13 @@ pub fn negotiateProtocolVersion(requested: ?[]const u8) []const u8 {
     return LEGACY_PROTOCOL_VERSIONS[LEGACY_PROTOCOL_VERSIONS.len - 1];
 }
 
-/// Build the default initialize result for a negotiated protocol version.
-/// Caller owns the returned slice.
-pub fn defaultInitializeResultForVersionAlloc(alloc: std.mem.Allocator, version: []const u8) ![]u8 {
+/// Build the default initialize result for a negotiated protocol version,
+/// with registry-aware capabilities. Caller owns the returned slice.
+pub fn defaultInitializeResultForVersionAlloc(comptime Registry: type, alloc: std.mem.Allocator, version: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         DEFAULT_INITIALIZE_RESULT_PREFIX,
         version,
-        DEFAULT_INITIALIZE_RESULT_SUFFIX,
+        comptime initializeSuffix(Registry),
     });
 }
 
@@ -169,7 +196,7 @@ pub fn defaultInitializeResultForVersionAlloc(alloc: std.mem.Allocator, version:
 pub fn initializeResultForVersionAlloc(comptime Registry: type, alloc: std.mem.Allocator, version: []const u8) ![]u8 {
     validateRegistry(Registry);
     if (@hasDecl(Registry, "initialize_result")) return alloc.dupe(u8, Registry.initialize_result);
-    return defaultInitializeResultForVersionAlloc(alloc, version);
+    return defaultInitializeResultForVersionAlloc(Registry, alloc, version);
 }
 
 // ── Log levels (RFC 5424 severity) ──────────────────────────────────────────
@@ -272,7 +299,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
 
     // Comptime perfect-hash method dispatch table — O(1) lookup, no sequential string comparisons.
-    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled, server_discover, subscriptions_listen };
+    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled, server_discover, subscriptions_listen, resources_list, resources_read, prompts_list, prompts_get, completion_complete };
     const method_map = std.StaticStringMap(Method).initComptime(.{
         .{ "ping", .ping },
         .{ "tools/list", .tools_list },
@@ -284,6 +311,11 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         .{ "notifications/cancelled", .notif_cancelled },
         .{ "server/discover", .server_discover },
         .{ "subscriptions/listen", .subscriptions_listen },
+        .{ "resources/list", .resources_list },
+        .{ "resources/read", .resources_read },
+        .{ "prompts/list", .prompts_list },
+        .{ "prompts/get", .prompts_get },
+        .{ "completion/complete", .completion_complete },
     });
 
     while (true) {
@@ -329,7 +361,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
             if (method_map.get(method)) |m| switch (m) {
                 // Fast path: no JSON parse needed — zero allocations
                 .ping => writeResultRaw(&session, scan.id_raw, "{}"),
-                .tools_list => writeToolsListResult(Registry, &session, scan.id_raw),
+                .tools_list => writeListResult(Registry, &session, scan.id_raw, "tools_list"),
                 .notif_initialized => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_roots_changed => { if (session.client_supports_roots) requestRoots(&session); },
                 .notif_cancelled => {},
@@ -361,6 +393,14 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
                     session.stamp_meta = true; // SubscriptionsListenResult requires _meta
                     writeResultRaw(&session, scan.id_raw, "{\"resultType\":\"complete\"}");
                 },
+
+                // resources/prompts/completions: optional registry decls gate
+                // these (absent decl → -32601, matching advertised capabilities)
+                .resources_list => writeListResult(Registry, &session, scan.id_raw, "resources_list"),
+                .resources_read => handleResourceRead(Registry, &session, &scan),
+                .prompts_list => writeListResult(Registry, &session, scan.id_raw, "prompts_list"),
+                .prompts_get => handlePromptGet(Registry, &session, &scan),
+                .completion_complete => handleCompletionComplete(Registry, &session, &scan),
             } else {
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
             }
@@ -402,9 +442,30 @@ fn handleCall(
     };
 
     // Run handler into reusable tool_buf (clear, not free).
+    s.tool_buf.clearRetainingCapacity();
+
+    // MRTR (2026-07-28): registries may expose
+    //   dispatchFastRaw(alloc, io, tool, args_raw, meta_raw, out) bool
+    // to own the ENTIRE result object — including resultType:"inputRequired"
+    // + inputRequests for multi round-trip requests. The follow-up request's
+    // params._meta (carrying inputResponses) is forwarded as meta_raw; the
+    // registry correlates via its own requestState. The _meta serverInfo
+    // envelope is still injected for modern requests.
+    if (@hasDecl(Registry, "dispatchFastRaw")) {
+        _ = Registry.dispatchFastRaw(alloc, s.io, tool, args_raw, scan.meta_raw, &s.tool_buf);
+        const buf = &s.write_buf;
+        buf.clearRetainingCapacity();
+        buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+        buf.appendSlice(alloc, id_raw orelse "null") catch return;
+        buf.appendSlice(alloc, ",\"result\":") catch return;
+        appendResultValue(alloc, buf, s.tool_buf.items, s.stamp_meta);
+        buf.appendSlice(alloc, "}\n") catch return;
+        s.stdout.writeStreamingAll(s.io, buf.items) catch {};
+        return;
+    }
+
     // Registries may expose dispatchFastOk to report handler failure — it
     // feeds the result's `isError` flag; absent the hook, assume success.
-    s.tool_buf.clearRetainingCapacity();
     const tool_ok = if (@hasDecl(Registry, "dispatchFastOk"))
         Registry.dispatchFastOk(alloc, s.io, tool, args_raw, &s.tool_buf)
     else blk: {
@@ -668,12 +729,19 @@ fn writeResultRaw(s: *Session, id_raw: ?[]const u8, result: []const u8) void {
     s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
-/// tools/list result. Modern (2026-07-28) ListToolsResult additionally
-/// requires `resultType`, `ttlMs`, and `cacheScope` — injected here alongside
-/// the `_meta` serverInfo envelope. Legacy responses are byte-identical.
-fn writeToolsListResult(comptime Registry: type, s: *Session, id_raw: ?[]const u8) void {
+/// List-type result (tools/list, resources/list, prompts/list). Modern
+/// (2026-07-28) list results additionally require `resultType`, `ttlMs`, and
+/// `cacheScope` — injected here alongside the `_meta` serverInfo envelope.
+/// Legacy responses are byte-identical. Registries lacking an optional list
+/// decl (resources_list / prompts_list) get -32601.
+fn writeListResult(comptime Registry: type, s: *Session, id_raw: ?[]const u8, comptime decl_name: []const u8) void {
+    if (!@hasDecl(Registry, decl_name)) {
+        writeErrorRaw(s, id_raw, -32601, "Method not found");
+        return;
+    }
+    const fragment = @field(Registry, decl_name);
     if (!s.stamp_meta) {
-        writeResultRaw(s, id_raw, Registry.tools_list);
+        writeResultRaw(s, id_raw, fragment);
         return;
     }
     const alloc = s.alloc;
@@ -682,9 +750,115 @@ fn writeToolsListResult(comptime Registry: type, s: *Session, id_raw: ?[]const u
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     buf.appendSlice(alloc, id_raw orelse "null") catch return;
     buf.appendSlice(alloc, ",\"result\":{" ++ MODERN_RESULT_META ++ ",\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
-    // Registry.tools_list is '{"tools":[...]}' — splice in after the '{'.
-    appendStrippingNewlines(alloc, buf, Registry.tools_list[1..]);
+    // fragment is '{"tools":[...]}'-shaped — splice in after the '{'.
+    appendStrippingNewlines(alloc, buf, fragment[1..]);
     buf.appendSlice(alloc, "}\n") catch return;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
+}
+
+/// resources/read. Registry hook: `readResourceFast(alloc, io, uri, out) bool`
+/// — `out` receives the contents ARRAY fragment (e.g. [{"uri":...,"text":...}]).
+fn handleResourceRead(comptime Registry: type, s: *Session, scan: *const json.ScanResult) void {
+    if (!@hasDecl(Registry, "readResourceFast")) {
+        writeErrorRaw(s, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const uri = json.scanStr(params_raw, "uri") orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing uri");
+        return;
+    };
+    s.tool_buf.clearRetainingCapacity();
+    if (!Registry.readResourceFast(s.alloc, s.io, uri, &s.tool_buf)) {
+        writeErrorRaw(s, scan.id_raw, -32603, "Resource read failed");
+        return;
+    }
+    // Modern ReadResourceResult requires resultType, ttlMs, cacheScope.
+    writeKeyedResult(s, scan.id_raw, "\"contents\":", s.tool_buf.items, true);
+}
+
+/// prompts/get. Registry hook: `getPromptFast(alloc, io, name, args_raw, out)
+/// bool` — `out` receives the messages ARRAY fragment (PromptMessage[]).
+fn handlePromptGet(comptime Registry: type, s: *Session, scan: *const json.ScanResult) void {
+    if (!@hasDecl(Registry, "getPromptFast")) {
+        writeErrorRaw(s, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const name = json.scanStr(params_raw, "name") orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing name");
+        return;
+    };
+    const args_raw = json.scanObj(params_raw, "arguments") orelse "{}";
+    s.tool_buf.clearRetainingCapacity();
+    if (!Registry.getPromptFast(s.alloc, s.io, name, args_raw, &s.tool_buf)) {
+        writeErrorRaw(s, scan.id_raw, -32603, "Prompt get failed");
+        return;
+    }
+    // Modern GetPromptResult requires resultType (no ttlMs/cacheScope).
+    writeKeyedResult(s, scan.id_raw, "\"messages\":", s.tool_buf.items, false);
+}
+
+/// completion/complete. Registry hook: `completeFast(alloc, io, ref_raw,
+/// arg_name, arg_value, out) bool` — `out` receives the completion OBJECT
+/// fragment ({"values":[...],"total"?,"hasMore"?}).
+fn handleCompletionComplete(comptime Registry: type, s: *Session, scan: *const json.ScanResult) void {
+    if (!@hasDecl(Registry, "completeFast")) {
+        writeErrorRaw(s, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const ref_raw = json.scanObj(params_raw, "ref") orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing ref");
+        return;
+    };
+    const arg_raw = json.scanObj(params_raw, "argument") orelse {
+        writeErrorRaw(s, scan.id_raw, -32602, "Missing argument");
+        return;
+    };
+    const arg_name = json.scanStr(arg_raw, "name") orelse "";
+    const arg_value = json.scanStr(arg_raw, "value") orelse "";
+    s.tool_buf.clearRetainingCapacity();
+    if (!Registry.completeFast(s.alloc, s.io, ref_raw, arg_name, arg_value, &s.tool_buf)) {
+        writeErrorRaw(s, scan.id_raw, -32603, "Completion failed");
+        return;
+    }
+    // Modern CompleteResult requires resultType (no ttlMs/cacheScope).
+    writeKeyedResult(s, scan.id_raw, "\"completion\":", s.tool_buf.items, false);
+}
+
+/// Shared builder for resources/read, prompts/get, completion/complete:
+/// `"result":{<key><fragment>}` for legacy; modern additionally gets
+/// `resultType` (+ `ttlMs`/`cacheScope` when the schema requires them) and the
+/// `_meta` serverInfo envelope.
+fn writeKeyedResult(s: *Session, id_raw: ?[]const u8, comptime key: []const u8, fragment: []const u8, comptime cacheable: bool) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.ensureTotalCapacity(alloc, 160 + fragment.len) catch {};
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"result\":{") catch return;
+    if (s.stamp_meta) {
+        buf.appendSlice(alloc, MODERN_RESULT_META ++ ",") catch return;
+        if (cacheable) {
+            buf.appendSlice(alloc, "\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
+        } else {
+            buf.appendSlice(alloc, "\"resultType\":\"complete\",") catch return;
+        }
+    }
+    buf.appendSlice(alloc, key) catch return;
+    appendStrippingNewlines(alloc, buf, fragment);
+    buf.appendSlice(alloc, "}}\n") catch return;
     s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
@@ -870,8 +1044,80 @@ test "discover result advertises all supported versions" {
 
 test "defaultInitializeResultForVersionAlloc uses negotiated version" {
     const testing = std.testing;
-    const result = try defaultInitializeResultForVersionAlloc(testing.allocator, "2025-03-26");
+    const result = try defaultInitializeResultForVersionAlloc(default_tools, testing.allocator, "2025-03-26");
     defer testing.allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"protocolVersion\":\"2025-03-26\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"serverInfo\"") != null);
+}
+
+// ── resources / prompts / completions: registry-aware capabilities ──────────
+
+const mock_rpc_registry = struct {
+    pub const tools_list = "{\"tools\":[]}";
+    pub fn parse(name: []const u8) ?u0 {
+        _ = name;
+        return null;
+    }
+    pub fn dispatchFast(alloc: std.mem.Allocator, io: std.Io, tool: u0, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+        _ = alloc;
+        _ = io;
+        _ = tool;
+        _ = args_raw;
+        _ = out;
+    }
+
+    pub const resources_list = "{\"resources\":[{\"uri\":\"file:///readme\",\"name\":\"readme\"}]}";
+    pub const prompts_list = "{\"prompts\":[{\"name\":\"greet\"}]}";
+    pub fn readResourceFast(alloc: std.mem.Allocator, io: std.Io, uri: []const u8, out: *std.ArrayList(u8)) bool {
+        _ = io;
+        const s = std.fmt.allocPrint(alloc, "[{{\"uri\":\"{s}\",\"text\":\"demo\"}}]", .{uri}) catch return false;
+        defer alloc.free(s);
+        out.appendSlice(alloc, s) catch return false;
+        return true;
+    }
+    pub fn getPromptFast(alloc: std.mem.Allocator, io: std.Io, name: []const u8, args_raw: []const u8, out: *std.ArrayList(u8)) bool {
+        _ = io;
+        _ = args_raw;
+        const s = std.fmt.allocPrint(alloc, "[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":\"prompt:{s}\"}}}}]", .{name}) catch return false;
+        defer alloc.free(s);
+        out.appendSlice(alloc, s) catch return false;
+        return true;
+    }
+    pub fn completeFast(alloc: std.mem.Allocator, io: std.Io, ref_raw: []const u8, arg_name: []const u8, arg_value: []const u8, out: *std.ArrayList(u8)) bool {
+        _ = io;
+        _ = ref_raw;
+        _ = arg_name;
+        _ = arg_value;
+        out.appendSlice(alloc, "{\"values\":[\"a\",\"b\"]}") catch return false;
+        return true;
+    }
+};
+
+test "capabilities advertise resources/prompts/completions only when provided" {
+    const testing = std.testing;
+    const with = comptime capabilitiesJson(mock_rpc_registry);
+    try testing.expect(std.mem.indexOf(u8, with, "\"resources\":{\"listChanged\":false,\"subscribe\":false}") != null);
+    try testing.expect(std.mem.indexOf(u8, with, "\"prompts\":{\"listChanged\":false}") != null);
+    try testing.expect(std.mem.indexOf(u8, with, "\"completions\":{}") != null);
+    const without = comptime capabilitiesJson(default_tools);
+    try testing.expect(std.mem.indexOf(u8, without, "\"resources\"") == null);
+    try testing.expect(std.mem.indexOf(u8, without, "\"prompts\"") == null);
+    try testing.expect(std.mem.indexOf(u8, without, "\"completions\"") == null);
+}
+
+test "discoverResult is registry-aware" {
+    const testing = std.testing;
+    const d = discoverResult(mock_rpc_registry);
+    try testing.expect(std.mem.indexOf(u8, d, "\"resources\":{\"listChanged\":false,\"subscribe\":false}") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "\"extensions\":{}") != null);
+    const base = discoverResult(default_tools);
+    try testing.expect(std.mem.indexOf(u8, base, "\"resources\"") == null);
+}
+
+test "initialize result includes registry-aware capabilities" {
+    const testing = std.testing;
+    const result = try defaultInitializeResultForVersionAlloc(mock_rpc_registry, testing.allocator, "2025-11-25");
+    defer testing.allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"resources\":{\"listChanged\":false,\"subscribe\":false}") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"completions\":{}") != null);
 }

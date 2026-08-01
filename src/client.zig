@@ -26,6 +26,35 @@ pub const McpClient = struct {
     stdout_buffer: []u8,
     line_buf: std.ArrayList(u8) = .empty,
 
+    /// Modern (2026-07-28) mode: when set, every request self-describes via
+    /// params._meta (protocolVersion + clientInfo + clientCapabilities) and no
+    /// initialize handshake is needed. Null = legacy handshake mode.
+    modern: ?ModernIdentity = null,
+
+    pub const ModernIdentity = struct {
+        name: []const u8,
+        version: []const u8,
+        protocol_version: []const u8 = "2026-07-28",
+    };
+
+    /// Opt into modern (2026-07-28) stateless mode: skip initialize entirely
+    /// and stamp every request with _meta.
+    pub fn useModern(self: *McpClient, identity: ModernIdentity) void {
+        self.modern = identity;
+    }
+
+    /// Append `"_meta":{...}` (no leading comma) for modern requests.
+    fn appendModernMeta(self: *McpClient, buf: *std.ArrayList(u8)) void {
+        const id = self.modern orelse return;
+        buf.appendSlice(self.alloc, "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"") catch return;
+        buf.appendSlice(self.alloc, id.protocol_version) catch return;
+        buf.appendSlice(self.alloc, "\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"") catch return;
+        json.writeEscaped(self.alloc, buf, id.name);
+        buf.appendSlice(self.alloc, "\",\"version\":\"") catch return;
+        json.writeEscaped(self.alloc, buf, id.version);
+        buf.appendSlice(self.alloc, "\"},\"io.modelcontextprotocol/clientCapabilities\":{}}") catch return;
+    }
+
     pub fn init(
         alloc: std.mem.Allocator,
         io: std.Io,
@@ -85,8 +114,49 @@ pub const McpClient = struct {
 
     /// List available tools. Returns raw JSON result string.
     pub fn listTools(self: *McpClient) ![]u8 {
+        if (self.modern != null) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.alloc);
+            var id_buf: [20]u8 = undefined;
+            const id = self.next_id;
+            self.next_id += 1;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, id_str) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, ",\"method\":\"tools/list\",\"params\":{") catch return error.OutOfMemory;
+            self.appendModernMeta(&buf);
+            buf.appendSlice(self.alloc, "}}\n") catch return error.OutOfMemory;
+            const stdin = self.process.stdin orelse return error.StdinClosed;
+            try stdin.writeStreamingAll(self.io, buf.items);
+            return self.readResponse();
+        }
         const req =
             \\{"jsonrpc":"2.0","id":__ID__,"method":"tools/list","params":{}}
+        ;
+        return self.sendAndReceive(req);
+    }
+
+    /// 2026-07-28: stateless discovery — the modern replacement for
+    /// initialize's version negotiation. Works in either mode.
+    pub fn discover(self: *McpClient) ![]u8 {
+        if (self.modern != null) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.alloc);
+            var id_buf: [20]u8 = undefined;
+            const id = self.next_id;
+            self.next_id += 1;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, id_str) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, ",\"method\":\"server/discover\",\"params\":{") catch return error.OutOfMemory;
+            self.appendModernMeta(&buf);
+            buf.appendSlice(self.alloc, "}}\n") catch return error.OutOfMemory;
+            const stdin = self.process.stdin orelse return error.StdinClosed;
+            try stdin.writeStreamingAll(self.io, buf.items);
+            return self.readResponse();
+        }
+        const req =
+            \\{"jsonrpc":"2.0","id":__ID__,"method":"server/discover","params":{}}
         ;
         return self.sendAndReceive(req);
     }
@@ -109,6 +179,10 @@ pub const McpClient = struct {
         json.writeEscaped(self.alloc, &buf, name);
         buf.appendSlice(self.alloc, "\",\"arguments\":") catch return error.OutOfMemory;
         buf.appendSlice(self.alloc, args_json) catch return error.OutOfMemory;
+        if (self.modern != null) {
+            buf.appendSlice(self.alloc, ",") catch return error.OutOfMemory;
+            self.appendModernMeta(&buf);
+        }
         buf.appendSlice(self.alloc, "}}\n") catch return error.OutOfMemory;
 
         const stdin = self.process.stdin orelse return error.StdinClosed;

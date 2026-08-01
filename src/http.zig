@@ -73,6 +73,7 @@ const Request = struct {
     protocol_version: ?[]const u8,
     mcp_method: ?[]const u8,
     mcp_name: ?[]const u8,
+    last_event_id: ?[]const u8,
     origin: ?[]const u8,
     host: ?[]const u8,
     body: []const u8,
@@ -213,7 +214,7 @@ fn handleConnection(
                 return;
             }
         }
-        respondSseUnavailable(&conn, session_id, protocol_version);
+        respondSseListen(allocator, &conn, session_id, protocol_version, req.last_event_id, detached);
         return;
     }
 
@@ -453,6 +454,21 @@ fn handleModernPost(
     } else if (std.mem.eql(u8, method, "server/discover")) {
         appendRpcResultRawMeta(allocator, &body, scan.id_raw, protocol.discoverResult(Registry), true);
         respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "resources/list")) {
+        appendListRpcResult(Registry, allocator, &body, scan.id_raw, "resources_list", true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "resources/read")) {
+        appendResourceReadRpc(Registry, allocator, io, &body, scan, true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "prompts/list")) {
+        appendListRpcResult(Registry, allocator, &body, scan.id_raw, "prompts_list", true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "prompts/get")) {
+        appendPromptGetRpc(Registry, allocator, io, &body, scan, true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+    } else if (std.mem.eql(u8, method, "completion/complete")) {
+        appendCompletionRpc(Registry, allocator, io, &body, scan, true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
     } else if (std.mem.eql(u8, method, "subscriptions/listen")) {
         handleSubscriptionsListen(allocator, conn, scan, detached);
     } else {
@@ -536,6 +552,159 @@ fn handleSubscriptionsListen(
     detached.* = true;
 }
 
+// ── resources / prompts / completions (both modes) ─────────────────────────
+//
+// Optional registry decls (absent → -32601, matching advertised capabilities):
+//   resources_list / prompts_list — '{"resources":[...]}' / '{"prompts":[...]}' fragments
+//   readResourceFast(alloc, io, uri, out) bool — out = contents ARRAY fragment
+//   getPromptFast(alloc, io, name, args_raw, out) bool — out = messages ARRAY fragment
+//   completeFast(alloc, io, ref_raw, arg_name, arg_value, out) bool — out = completion OBJECT fragment
+
+fn appendListRpcResult(
+    comptime Registry: type,
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    id_raw: ?[]const u8,
+    comptime decl_name: []const u8,
+    modern: bool,
+) void {
+    if (!@hasDecl(Registry, decl_name)) {
+        appendRpcError(allocator, body, id_raw, -32601, "Method not found");
+        return;
+    }
+    const fragment = @field(Registry, decl_name);
+    if (!modern) {
+        appendRpcResultRaw(allocator, body, id_raw, fragment);
+        return;
+    }
+    // 2026-07-28 list results require resultType, ttlMs, cacheScope.
+    body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    body.appendSlice(allocator, id_raw orelse "null") catch return;
+    body.appendSlice(allocator, ",\"result\":{" ++ protocol.MODERN_RESULT_META ++ ",\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
+    body.appendSlice(allocator, fragment[1..]) catch return;
+    body.appendSlice(allocator, "}") catch return;
+}
+
+/// Shared builder for resources/read, prompts/get, completion/complete.
+fn appendKeyedRpcResult(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    id_raw: ?[]const u8,
+    comptime key: []const u8,
+    fragment: []const u8,
+    comptime cacheable: bool,
+    modern: bool,
+) void {
+    body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    body.appendSlice(allocator, id_raw orelse "null") catch return;
+    body.appendSlice(allocator, ",\"result\":{") catch return;
+    if (modern) {
+        body.appendSlice(allocator, protocol.MODERN_RESULT_META ++ ",") catch return;
+        if (cacheable) {
+            body.appendSlice(allocator, "\"resultType\":\"complete\",\"ttlMs\":300000,\"cacheScope\":\"public\",") catch return;
+        } else {
+            body.appendSlice(allocator, "\"resultType\":\"complete\",") catch return;
+        }
+    }
+    body.appendSlice(allocator, key) catch return;
+    body.appendSlice(allocator, fragment) catch return;
+    body.appendSlice(allocator, "}}") catch return;
+}
+
+fn appendResourceReadRpc(
+    comptime Registry: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: *std.ArrayList(u8),
+    scan: *const json.ScanResult,
+    modern: bool,
+) void {
+    if (!@hasDecl(Registry, "readResourceFast")) {
+        appendRpcError(allocator, body, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const uri = json.scanStr(params_raw, "uri") orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing uri");
+        return;
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    if (!Registry.readResourceFast(allocator, io, uri, &out)) {
+        appendRpcError(allocator, body, scan.id_raw, -32603, "Resource read failed");
+        return;
+    }
+    appendKeyedRpcResult(allocator, body, scan.id_raw, "\"contents\":", out.items, true, modern);
+}
+
+fn appendPromptGetRpc(
+    comptime Registry: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: *std.ArrayList(u8),
+    scan: *const json.ScanResult,
+    modern: bool,
+) void {
+    if (!@hasDecl(Registry, "getPromptFast")) {
+        appendRpcError(allocator, body, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const name = json.scanStr(params_raw, "name") orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing name");
+        return;
+    };
+    const args_raw = json.scanObj(params_raw, "arguments") orelse "{}";
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    if (!Registry.getPromptFast(allocator, io, name, args_raw, &out)) {
+        appendRpcError(allocator, body, scan.id_raw, -32603, "Prompt get failed");
+        return;
+    }
+    appendKeyedRpcResult(allocator, body, scan.id_raw, "\"messages\":", out.items, false, modern);
+}
+
+fn appendCompletionRpc(
+    comptime Registry: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: *std.ArrayList(u8),
+    scan: *const json.ScanResult,
+    modern: bool,
+) void {
+    if (!@hasDecl(Registry, "completeFast")) {
+        appendRpcError(allocator, body, scan.id_raw, -32601, "Method not found");
+        return;
+    }
+    const params_raw = scan.params_raw orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing params");
+        return;
+    };
+    const ref_raw = json.scanObj(params_raw, "ref") orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing ref");
+        return;
+    };
+    const arg_raw = json.scanObj(params_raw, "argument") orelse {
+        appendRpcError(allocator, body, scan.id_raw, -32602, "Missing argument");
+        return;
+    };
+    const arg_name = json.scanStr(arg_raw, "name") orelse "";
+    const arg_value = json.scanStr(arg_raw, "value") orelse "";
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    if (!Registry.completeFast(allocator, io, ref_raw, arg_name, arg_value, &out)) {
+        appendRpcError(allocator, body, scan.id_raw, -32603, "Completion failed");
+        return;
+    }
+    appendKeyedRpcResult(allocator, body, scan.id_raw, "\"completion\":", out.items, false, modern);
+}
+
 fn appendToolCallResult(
     comptime Registry: type,
     allocator: std.mem.Allocator,
@@ -560,6 +729,34 @@ fn appendToolCallResult(
         appendRpcError(allocator, body, scan.id_raw, -32602, "Unknown tool");
         return;
     };
+
+    // MRTR (2026-07-28): registries may expose
+    //   dispatchFastRaw(alloc, io, tool, args_raw, meta_raw, out) bool
+    // to own the ENTIRE result object — including resultType:"inputRequired"
+    // + inputRequests. params._meta (carrying inputResponses on follow-up
+    // requests) is forwarded as meta_raw; correlation via the registry's own
+    // requestState. The _meta serverInfo envelope is injected when modern.
+    if (@hasDecl(Registry, "dispatchFastRaw")) {
+        var raw_buf: std.ArrayList(u8) = .empty;
+        defer raw_buf.deinit(allocator);
+        _ = Registry.dispatchFastRaw(allocator, io, tool, args_raw, scan.meta_raw, &raw_buf);
+        body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+        body.appendSlice(allocator, scan.id_raw orelse "null") catch return;
+        body.appendSlice(allocator, ",\"result\":") catch return;
+        if (modern and raw_buf.items.len >= 2 and raw_buf.items[0] == '{') {
+            body.appendSlice(allocator, "{" ++ protocol.MODERN_RESULT_META) catch return;
+            if (raw_buf.items[1] == '}') {
+                body.appendSlice(allocator, "}") catch return;
+            } else {
+                body.appendSlice(allocator, ",") catch return;
+                body.appendSlice(allocator, raw_buf.items[1..]) catch return;
+            }
+        } else {
+            body.appendSlice(allocator, raw_buf.items) catch return;
+        }
+        body.appendSlice(allocator, "}") catch return;
+        return;
+    }
 
     var tool_buf: std.ArrayList(u8) = .empty;
     defer tool_buf.deinit(allocator);
@@ -680,17 +877,40 @@ fn respondEmpty(conn: *Conn, status: []const u8, session_id: ?[]const u8, protoc
     respondJson(conn, status, "", session_id, protocol_version);
 }
 
-fn respondSseUnavailable(conn: *Conn, session_id: []const u8, protocol_version: []const u8) void {
-    const body = "event: mcp-zig\r\ndata: {\"status\":\"sse-not-implemented\",\"message\":\"POST request/response JSON-RPC is available; resumable SSE is future work.\"}\r\n\r\n";
+/// Legacy (2025-03-26..2025-11-25) GET listener: opens a real SSE stream for
+/// the session. `Last-Event-ID` is parsed for the resume contract; this server
+/// has no notification sources, so the event store is empty, every event id a
+/// client could present replays zero events, and only keep-alive comments
+/// flow. Client disconnect ends the stream (and, per 2025-era spec, may be
+/// followed by DELETE to end the session).
+fn respondSseListen(
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    session_id: []const u8,
+    protocol_version: []const u8,
+    last_event_id: ?[]const u8,
+    detached: *bool,
+) void {
+    _ = last_event_id; // replay buffer is empty — nothing to replay from any id
     var hdr_buf: [1024]u8 = undefined;
     const hdr = std.fmt.bufPrint(
         &hdr_buf,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\nMcp-Protocol-Version: {s}\r\nMcp-Session-Id: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\nAccess-Control-Expose-Headers: Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\n\r\n",
-        .{ body.len, protocol_version, session_id },
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nMcp-Protocol-Version: {s}\r\nMcp-Session-Id: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\nAccess-Control-Expose-Headers: Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID\r\n\r\n",
+        .{ protocol_version, session_id },
     ) catch return;
     conn.writeAll(hdr);
-    conn.writeAll(body);
     conn.flush();
+
+    // Hand the connection to a detached keep-alive thread (shared with the
+    // 2026-07-28 subscriptions/listen path); the accept loop must NOT close it.
+    const ctx = allocator.create(ListenCtx) catch return;
+    ctx.* = .{ .io = conn.io, .stream = conn.stream, .alloc = allocator };
+    const t = std.Thread.spawn(.{}, listenKeepAlive, .{ctx}) catch {
+        allocator.destroy(ctx);
+        return;
+    };
+    t.detach();
+    detached.* = true;
 }
 
 fn parseRequest(raw: []const u8) ?Request {
@@ -720,6 +940,7 @@ fn parseRequest(raw: []const u8) ?Request {
         .protocol_version = headerValue(headers, "Mcp-Protocol-Version"),
         .mcp_method = headerValue(headers, "Mcp-Method"),
         .mcp_name = headerValue(headers, "Mcp-Name"),
+        .last_event_id = headerValue(headers, "Last-Event-ID"),
         .origin = headerValue(headers, "Origin"),
         .host = headerValue(headers, "Host"),
         .body = body,

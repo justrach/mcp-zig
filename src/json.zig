@@ -124,12 +124,13 @@ pub fn scanJsonRpc(data: []const u8) ScanResult {
             // Capture the raw params object as a slice
             const val_start = i;
             skipJsonValue(data, &i);
-            result.params_raw = data[val_start..i];
+            // Malformed input can run the skip past the end — never panic on it.
+            result.params_raw = data[val_start..@min(i, data.len)];
         } else if (eql(key, "_meta")) {
             // Capture a top-level raw _meta object as a slice
             const val_start = i;
             skipJsonValue(data, &i);
-            result.meta_raw = data[val_start..i];
+            result.meta_raw = data[val_start..@min(i, data.len)];
         } else {
             // Skip unknown value
             skipJsonValue(data, &i);
@@ -311,7 +312,7 @@ pub fn scanObj(data: []const u8, key: []const u8) ?[]const u8 {
             if (data[i] != '{') return null;
             const vs = i;
             skipJsonValue(data, &i);
-            return data[vs..i];
+            return data[vs..@min(i, data.len)];
         }
         skipJsonValue(data, &i);
     }
