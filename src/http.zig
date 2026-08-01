@@ -250,12 +250,41 @@ fn handlePost(
         return;
     };
 
+    // 2026-07-28 modern gate: a request carrying _meta.protocolVersion opts
+    // into stateless mode. The MCP-Protocol-Version header (when present) must
+    // match it; unknown versions get the spec-mandated error (HTTP 400).
+    const modern = blk: {
+        const v = json.metaProtocolVersion(scan.meta_raw) orelse break :blk false;
+        if (req.protocol_version) |hv| {
+            if (!std.mem.eql(u8, hv, v)) {
+                respondJson(conn, "400 Bad Request", "{\"error\":\"mcp-protocol-version header does not match _meta protocolVersion\"}", null, PROTOCOL_VERSION);
+                return;
+            }
+        }
+        if (!protocol.isSupportedProtocolVersion(v)) {
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(allocator);
+            appendUnsupportedProtocolVersion(allocator, &body, scan.id_raw, v);
+            respondJson(conn, "400 Bad Request", body.items, null, PROTOCOL_VERSION);
+            return;
+        }
+        break :blk true;
+    };
+
+    // server/discover is stateless by design: no session, no initialize.
+    if (std.mem.eql(u8, method, "server/discover")) {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        appendRpcResultRawMeta(allocator, &body, scan.id_raw, protocol.discoverResult(Registry), true);
+        respondJson(conn, "200 OK", body.items, null, protocol.MODERN_PROTOCOL_VERSION);
+        return;
+    }
+
     if (std.mem.eql(u8, method, "initialize")) {
         const requested_version = if (scan.params_raw) |params_raw|
             json.scanStr(params_raw, "protocolVersion")
         else
-            null;
-        const negotiated = protocol.negotiateProtocolVersion(requested_version);
+            null;        const negotiated = protocol.negotiateProtocolVersion(requested_version);
         const session_id = sessions.create(negotiated) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"session create failed\"}", null, PROTOCOL_VERSION);
             return;
@@ -296,13 +325,13 @@ fn handlePost(
     defer body.deinit(allocator);
 
     if (std.mem.eql(u8, method, "ping")) {
-        appendRpcResultRaw(allocator, &body, scan.id_raw, "{}");
+        appendRpcResultRawMeta(allocator, &body, scan.id_raw, "{}", modern);
     } else if (std.mem.eql(u8, method, "tools/list")) {
-        appendRpcResultRaw(allocator, &body, scan.id_raw, Registry.tools_list);
+        appendRpcResultRawMeta(allocator, &body, scan.id_raw, Registry.tools_list, modern);
     } else if (std.mem.eql(u8, method, "tools/call")) {
-        appendToolCallResult(Registry, allocator, io, &body, &scan);
+        appendToolCallResult(Registry, allocator, io, &body, &scan, modern);
     } else if (std.mem.eql(u8, method, "logging/setLevel")) {
-        appendRpcResultRaw(allocator, &body, scan.id_raw, "{}");
+        appendRpcResultRawMeta(allocator, &body, scan.id_raw, "{}", modern);
     } else {
         appendRpcError(allocator, &body, scan.id_raw, -32601, "Method not found");
     }
@@ -316,6 +345,7 @@ fn appendToolCallResult(
     io: std.Io,
     body: *std.ArrayList(u8),
     scan: *const json.ScanResult,
+    modern: bool,
 ) void {
     const params_raw = scan.params_raw orelse {
         appendRpcError(allocator, body, scan.id_raw, -32602, "Missing params");
@@ -347,6 +377,9 @@ fn appendToolCallResult(
         body.appendSlice(allocator, ",\"structuredContent\":") catch return;
         body.appendSlice(allocator, tool_buf.items) catch return;
     }
+    if (modern) {
+        body.appendSlice(allocator, "," ++ protocol.MODERN_RESULT_META) catch return;
+    }
     body.appendSlice(allocator, "}}") catch return;
 }
 
@@ -356,11 +389,49 @@ fn appendRpcResultRaw(
     id_raw: ?[]const u8,
     result: []const u8,
 ) void {
+    appendRpcResultRawMeta(allocator, body, id_raw, result, false);
+}
+
+/// `appendRpcResultRaw` + modern (2026-07-28) `_meta` serverInfo envelope:
+/// when `stamp` is set and `result` is a JSON object, the envelope is injected
+/// as the first result key (per ResultMetaObject).
+fn appendRpcResultRawMeta(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    id_raw: ?[]const u8,
+    result: []const u8,
+    stamp: bool,
+) void {
     body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     body.appendSlice(allocator, id_raw orelse "null") catch return;
     body.appendSlice(allocator, ",\"result\":") catch return;
-    body.appendSlice(allocator, result) catch return;
+    if (stamp and result.len >= 2 and result[0] == '{') {
+        body.appendSlice(allocator, "{" ++ protocol.MODERN_RESULT_META) catch return;
+        if (result[1] == '}') {
+            body.appendSlice(allocator, "}") catch return;
+        } else {
+            body.appendSlice(allocator, ",") catch return;
+            body.appendSlice(allocator, result[1..]) catch return;
+        }
+    } else {
+        body.appendSlice(allocator, result) catch return;
+    }
     body.appendSlice(allocator, "}") catch return;
+}
+
+/// 2026-07-28 UnsupportedProtocolVersionError: code -32022 with
+/// `data: { requested, supported }`. HTTP transport MUST pair this with 400.
+fn appendUnsupportedProtocolVersion(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    id_raw: ?[]const u8,
+    requested: []const u8,
+) void {
+    body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    body.appendSlice(allocator, id_raw orelse "null") catch return;
+    body.appendSlice(allocator, ",\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"") catch return;
+    json.writeEscaped(allocator, body, requested);
+    body.appendSlice(allocator, "\",\"supported\":" ++ protocol.SUPPORTED_VERSIONS_JSON ++ "}}}") catch return;
 }
 
 fn appendRpcError(

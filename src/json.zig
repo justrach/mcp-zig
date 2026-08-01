@@ -49,6 +49,7 @@ pub const ScanResult = struct {
     method: ?[]const u8 = null, // points into the source JSON
     id_raw: ?[]const u8 = null, // raw JSON fragment for id (e.g. "1" or "\"abc\"")
     params_raw: ?[]const u8 = null, // raw JSON of the params object (for tools/call fast path)
+    meta_raw: ?[]const u8 = null, // raw JSON of the _meta object (top-level, else params._meta)
     has_result: bool = false,
     has_error: bool = false,
 };
@@ -124,12 +125,42 @@ pub fn scanJsonRpc(data: []const u8) ScanResult {
             const val_start = i;
             skipJsonValue(data, &i);
             result.params_raw = data[val_start..i];
+        } else if (eql(key, "_meta")) {
+            // Capture a top-level raw _meta object as a slice
+            const val_start = i;
+            skipJsonValue(data, &i);
+            result.meta_raw = data[val_start..i];
         } else {
             // Skip unknown value
             skipJsonValue(data, &i);
         }
     }
+    // MCP 2026-07-28 carries versioning/client metadata in params._meta, which
+    // the loop above skips over as part of the params value — fall back to a
+    // targeted scan of the params slice.
+    if (result.meta_raw == null) {
+        if (result.params_raw) |p| result.meta_raw = scanObj(p, "_meta");
+    }
     return result;
+}
+
+// ── MCP 2026-07-28 _meta keys ────────────────────────────────────────────────
+
+pub const META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+pub const META_LOG_LEVEL = "io.modelcontextprotocol/logLevel";
+pub const META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo";
+pub const META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+
+/// Extract a string-valued _meta key (e.g. protocolVersion, logLevel).
+pub fn metaStr(meta_raw: ?[]const u8, key: []const u8) ?[]const u8 {
+    const m = meta_raw orelse return null;
+    return scanStr(m, key);
+}
+
+/// Extract the per-request protocol version a modern (2026-07-28) client
+/// stamps into `_meta`, if any. Null means a legacy (pre-2026-07-28) request.
+pub fn metaProtocolVersion(meta_raw: ?[]const u8) ?[]const u8 {
+    return metaStr(meta_raw, META_PROTOCOL_VERSION);
 }
 
 /// Skip one JSON value starting at data[i*]. Advances i past the value.

@@ -32,17 +32,79 @@ const default_tools = @import("tools.zig");
 
 pub const PROTOCOL_VERSION = "2025-06-18";
 
-/// Versions this implementation has been verified against, newest first.
+/// Newest protocol revision: the stateless ("Modern") spec — no initialize
+/// handshake, per-request `_meta` versioning, mandatory `server/discover`.
+pub const MODERN_PROTOCOL_VERSION = "2026-07-28";
+
+/// Every version this implementation accepts, newest first. Advertised via
+/// `server/discover` and used to validate modern per-request `_meta` versions.
 /// Keep this conservative: only add a version once the core lifecycle/transport
 /// behavior has been audited for that spec revision.
 pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
+    "2026-07-28",
+    "2025-11-25",
     "2025-06-18",
     "2025-03-26",
     "2024-11-05",
 };
 
+/// Versions offered by the legacy initialize handshake, newest first.
+/// 2026-07-28 is deliberately excluded: modern clients never call initialize,
+/// so legacy negotiation must never clamp up to it.
+pub const LEGACY_PROTOCOL_VERSIONS = [_][]const u8{
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+};
+
+/// JSON-RPC error code for the 2026-07-28 UnsupportedProtocolVersionError.
+pub const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
+
+const DEFAULT_SERVER_INFO_OBJ = "{\"name\":\"mcp-zig\",\"title\":\"MCP Zig Server\",\"version\":\"1.0.0\"}";
+const DEFAULT_CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
+const DEFAULT_INSTRUCTIONS_TEXT = "MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries.";
+
+/// `_meta` envelope stamped as the first key of every result for modern
+/// (2026-07-28) requests, per the ResultMetaObject schema.
+pub const MODERN_RESULT_META = "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":" ++ DEFAULT_SERVER_INFO_OBJ ++ "}";
+
+fn buildSupportedVersionsJson() []const u8 {
+    comptime var out: []const u8 = "[";
+    comptime {
+        for (SUPPORTED_PROTOCOL_VERSIONS, 0..) |v, idx| {
+            if (idx != 0) out = out ++ ",";
+            out = out ++ "\"" ++ v ++ "\"";
+        }
+    }
+    return out ++ "]";
+}
+
+/// `["2026-07-28","2025-11-25",...]` — comptime-joined from SUPPORTED_PROTOCOL_VERSIONS.
+pub const SUPPORTED_VERSIONS_JSON = buildSupportedVersionsJson();
+
+/// Default `server/discover` result (2026-07-28 DiscoverResult). Stateless:
+/// requires no session and no initialize handshake. Registries may override
+/// with `pub const discover_result = "{...}"`.
+pub const DISCOVER_RESULT = "{\"resultType\":\"complete\",\"supportedVersions\":" ++ SUPPORTED_VERSIONS_JSON ++ ",\"capabilities\":" ++ DEFAULT_CAPABILITIES_JSON ++ ",\"ttlMs\":300000,\"cacheScope\":\"public\",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
+
+/// Discover result for a registry: `discover_result` override wins, else default.
+pub fn discoverResult(comptime Registry: type) []const u8 {
+    validateRegistry(Registry);
+    if (@hasDecl(Registry, "discover_result")) return Registry.discover_result;
+    return DISCOVER_RESULT;
+}
+
+/// Membership check for modern per-request `_meta` protocol versions.
+pub fn isSupportedProtocolVersion(v: []const u8) bool {
+    for (SUPPORTED_PROTOCOL_VERSIONS) |sv| {
+        if (std.mem.eql(u8, v, sv)) return true;
+    }
+    return false;
+}
+
 const DEFAULT_INITIALIZE_RESULT_PREFIX = "{\"protocolVersion\":\"";
-const DEFAULT_INITIALIZE_RESULT_SUFFIX = "\",\"capabilities\":{\"tools\":{\"listChanged\":false},\"logging\":{}},\"serverInfo\":{\"name\":\"mcp-zig\",\"title\":\"MCP Zig Server\",\"version\":\"1.0.0\"},\"instructions\":\"MCP Zig server providing filesystem tools. Use read_file to read file contents and list_dir to list directory entries.\"}";
+const DEFAULT_INITIALIZE_RESULT_SUFFIX = "\",\"capabilities\":" ++ DEFAULT_CAPABILITIES_JSON ++ ",\"serverInfo\":" ++ DEFAULT_SERVER_INFO_OBJ ++ ",\"instructions\":\"" ++ DEFAULT_INSTRUCTIONS_TEXT ++ "\"}";
 
 pub const DEFAULT_INITIALIZE_RESULT = DEFAULT_INITIALIZE_RESULT_PREFIX ++ PROTOCOL_VERSION ++ DEFAULT_INITIALIZE_RESULT_SUFFIX;
 
@@ -78,14 +140,14 @@ pub fn negotiateProtocolVersion(requested: ?[]const u8) []const u8 {
     const req = requested orelse return PROTOCOL_VERSION;
     if (req.len == 0) return PROTOCOL_VERSION;
 
-    for (SUPPORTED_PROTOCOL_VERSIONS) |v| {
+    for (LEGACY_PROTOCOL_VERSIONS) |v| {
         if (std.mem.eql(u8, req, v)) return v;
     }
 
-    if (std.mem.order(u8, req, SUPPORTED_PROTOCOL_VERSIONS[0]) == .gt) {
-        return SUPPORTED_PROTOCOL_VERSIONS[0];
+    if (std.mem.order(u8, req, LEGACY_PROTOCOL_VERSIONS[0]) == .gt) {
+        return LEGACY_PROTOCOL_VERSIONS[0];
     }
-    return SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len - 1];
+    return LEGACY_PROTOCOL_VERSIONS[LEGACY_PROTOCOL_VERSIONS.len - 1];
 }
 
 /// Build the default initialize result for a negotiated protocol version.
@@ -151,6 +213,10 @@ const Session = struct {
     // Logging (#3)
     log_level: LogLevel = .warning,
 
+    // Modern (2026-07-28) mode for the in-flight request: stamp results with
+    // the _meta serverInfo envelope. Reset per request in the read loop.
+    stamp_meta: bool = false,
+
     // Reusable buffers — allocated once, cleared between requests (Rust BytesMut pattern).
     // Avoids per-request alloc/free cycles in the hot path.
     write_buf: std.ArrayList(u8) = .empty,
@@ -203,7 +269,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
 
     // Comptime perfect-hash method dispatch table — O(1) lookup, no sequential string comparisons.
-    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled };
+    const Method = enum { ping, tools_list, tools_call, initialize, logging_setLevel, notif_initialized, notif_roots_changed, notif_cancelled, server_discover };
     const method_map = std.StaticStringMap(Method).initComptime(.{
         .{ "ping", .ping },
         .{ "tools/list", .tools_list },
@@ -213,6 +279,7 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         .{ "notifications/initialized", .notif_initialized },
         .{ "notifications/roots/list_changed", .notif_roots_changed },
         .{ "notifications/cancelled", .notif_cancelled },
+        .{ "server/discover", .server_discover },
     });
 
     while (true) {
@@ -222,6 +289,22 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         if (input.len == 0) continue;
 
         const scan = json.scanJsonRpc(input);
+
+        // 2026-07-28 modern gate: a request carrying _meta.protocolVersion opts
+        // into stateless mode. Unknown versions get the spec-mandated
+        // UnsupportedProtocolVersionError; known versions get _meta-stamped results.
+        session.stamp_meta = false;
+        if (json.metaProtocolVersion(scan.meta_raw)) |v| {
+            if (!isSupportedProtocolVersion(v)) {
+                writeUnsupportedProtocolVersion(&session, scan.id_raw, v);
+                continue;
+            }
+            session.stamp_meta = true;
+            // Per-request log-level opt-in (replaces legacy logging/setLevel).
+            if (json.metaStr(scan.meta_raw, json.META_LOG_LEVEL)) |lvl| {
+                session.log_level = logLevelFromString(lvl) orelse session.log_level;
+            }
+        }
 
         if (scan.method) |method| {
             if (method_map.get(method)) |m| switch (m) {
@@ -238,6 +321,12 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
                 // initialize + logging/setLevel: scanner-based (no std.json parse)
                 .initialize => handleInitializeFast(Registry, &session, &scan),
                 .logging_setLevel => handleSetLogLevelFast(&session, &scan),
+
+                // 2026-07-28: stateless discovery — always _meta-stamped
+                .server_discover => {
+                    session.stamp_meta = true;
+                    writeResultRaw(&session, scan.id_raw, discoverResult(Registry));
+                },
             } else {
                 if (scan.id_raw != null) writeErrorRaw(&session, scan.id_raw, -32601, "Method not found");
             }
@@ -298,6 +387,10 @@ fn handleCall(
             buf.appendSlice(alloc, ",\"structuredContent\":") catch return;
             buf.appendSlice(alloc, s.tool_buf.items) catch return;
         }
+    }
+
+    if (s.stamp_meta) {
+        buf.appendSlice(alloc, "," ++ MODERN_RESULT_META) catch return;
     }
 
     buf.appendSlice(alloc, "}}\n") catch return;
@@ -527,8 +620,39 @@ fn writeResultRaw(s: *Session, id_raw: ?[]const u8, result: []const u8) void {
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     buf.appendSlice(alloc, id_raw orelse "null") catch return;
     buf.appendSlice(alloc, ",\"result\":") catch return;
-    appendStrippingNewlines(alloc, buf, result);
+    appendResultValue(alloc, buf, result, s.stamp_meta);
     buf.appendSlice(alloc, "}\n") catch return;
+    s.stdout.writeStreamingAll(s.io, buf.items) catch {};
+}
+
+/// Append a `"result"` value, injecting the modern (2026-07-28) `_meta`
+/// serverInfo envelope as the first key when `stamp` is set. `result` must be
+/// a JSON object; anything else is appended verbatim.
+fn appendResultValue(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), result: []const u8, stamp: bool) void {
+    if (!stamp or result.len < 2 or result[0] != '{') {
+        appendStrippingNewlines(alloc, buf, result);
+        return;
+    }
+    buf.appendSlice(alloc, "{" ++ MODERN_RESULT_META) catch return;
+    if (result[1] == '}') {
+        buf.appendSlice(alloc, "}") catch return;
+        return;
+    }
+    buf.appendSlice(alloc, ",") catch return;
+    appendStrippingNewlines(alloc, buf, result[1..]);
+}
+
+/// 2026-07-28 UnsupportedProtocolVersionError: code -32022 with
+/// `data: { requested, supported }` so the client can pick a version and retry.
+fn writeUnsupportedProtocolVersion(s: *Session, id_raw: ?[]const u8, requested: []const u8) void {
+    const alloc = s.alloc;
+    const buf = &s.write_buf;
+    buf.clearRetainingCapacity();
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    buf.appendSlice(alloc, id_raw orelse "null") catch return;
+    buf.appendSlice(alloc, ",\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"requested\":\"") catch return;
+    json.writeEscaped(alloc, buf, requested);
+    buf.appendSlice(alloc, "\",\"supported\":" ++ SUPPORTED_VERSIONS_JSON ++ "}}}\n") catch return;
     s.stdout.writeStreamingAll(s.io, buf.items) catch {};
 }
 
@@ -648,6 +772,7 @@ fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Val
 
 test "negotiateProtocolVersion echoes known versions" {
     const testing = std.testing;
+    try testing.expectEqualStrings("2025-11-25", negotiateProtocolVersion("2025-11-25"));
     try testing.expectEqualStrings("2025-06-18", negotiateProtocolVersion("2025-06-18"));
     try testing.expectEqualStrings("2025-03-26", negotiateProtocolVersion("2025-03-26"));
     try testing.expectEqualStrings("2024-11-05", negotiateProtocolVersion("2024-11-05"));
@@ -657,8 +782,27 @@ test "negotiateProtocolVersion handles absent and unknown versions" {
     const testing = std.testing;
     try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateProtocolVersion(null));
     try testing.expectEqualStrings(PROTOCOL_VERSION, negotiateProtocolVersion(""));
-    try testing.expectEqualStrings("2025-06-18", negotiateProtocolVersion("2025-11-25"));
+    // Modern versions are never offered by the legacy initialize handshake.
+    try testing.expectEqualStrings("2025-11-25", negotiateProtocolVersion("2026-07-28"));
+    try testing.expectEqualStrings("2025-11-25", negotiateProtocolVersion("2099-01-01"));
     try testing.expectEqualStrings("2024-11-05", negotiateProtocolVersion("2024-01-01"));
+}
+
+test "isSupportedProtocolVersion covers modern and legacy" {
+    const testing = std.testing;
+    try testing.expect(isSupportedProtocolVersion("2026-07-28"));
+    try testing.expect(isSupportedProtocolVersion("2025-11-25"));
+    try testing.expect(isSupportedProtocolVersion("2025-06-18"));
+    try testing.expect(!isSupportedProtocolVersion("2099-01-01"));
+    try testing.expect(!isSupportedProtocolVersion(""));
+}
+
+test "discover result advertises all supported versions" {
+    const testing = std.testing;
+    try testing.expect(std.mem.indexOf(u8, DISCOVER_RESULT, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, DISCOVER_RESULT, "\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\",\"2025-03-26\",\"2024-11-05\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, DISCOVER_RESULT, "\"cacheScope\":\"public\"") != null);
+    try testing.expect(std.mem.indexOf(u8, DISCOVER_RESULT, "\"ttlMs\":300000") != null);
 }
 
 test "defaultInitializeResultForVersionAlloc uses negotiated version" {
