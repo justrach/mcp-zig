@@ -30,9 +30,9 @@ pub const Tool = enum {
 
 pub const tools_list =
     \\{"tools":[
-    \\{"name":"read_file","description":"Read a file from the filesystem and return its contents as text.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file"},"max_bytes":{"type":"integer","description":"Maximum bytes to read (default: 1MB)"}},"required":["path"]}},
-    \\{"name":"list_dir","description":"List files and directories at a path.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory path to list (default: current directory)"}},"required":[]}},
-    \\{"name":"batch","description":"Run multiple read_file or list_dir operations in one tool call and return ordered per-item results.","inputSchema":{"type":"object","properties":{"operations":{"type":"array","description":"Operations to execute in order.","items":{"type":"object","properties":{"tool":{"type":"string","enum":["read_file","list_dir"],"description":"Nested tool to execute."},"arguments":{"type":"object","description":"Arguments for the nested tool."}},"required":["tool","arguments"]}}},"required":["operations"]}}
+    \\{"name":"read_file","title":"Read File","description":"Read a file from the filesystem and return its contents as text.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute or relative path to the file"},"max_bytes":{"type":"integer","description":"Maximum bytes to read (default: 1MB)"}},"required":["path"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}},
+    \\{"name":"list_dir","title":"List Directory","description":"List files and directories at a path.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory path to list (default: current directory)"}},"required":[]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}},
+    \\{"name":"batch","title":"Batch Operations","description":"Run multiple read_file or list_dir operations in one tool call and return ordered per-item results.","inputSchema":{"type":"object","properties":{"operations":{"type":"array","description":"Operations to execute in order.","items":{"type":"object","properties":{"tool":{"type":"string","enum":["read_file","list_dir"],"description":"Nested tool to execute."},"arguments":{"type":"object","description":"Arguments for the nested tool."}},"required":["tool","arguments"]}}},"required":["operations"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}
     \\]}
 ;
 
@@ -65,7 +65,19 @@ pub fn dispatchFast(
     args_raw: []const u8,
     out: *std.ArrayList(u8),
 ) void {
-    _ = dispatchFastResult(alloc, io, tool, args_raw, out);
+    _ = dispatchFastOk(alloc, io, tool, args_raw, out);
+}
+
+/// `dispatchFast` variant that reports handler success, so transports can set
+/// `isError` on tool results (2025-11-25 conformance).
+pub fn dispatchFastOk(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    tool: Tool,
+    args_raw: []const u8,
+    out: *std.ArrayList(u8),
+) bool {
+    return dispatchFastResult(alloc, io, tool, args_raw, out);
 }
 
 fn dispatchResult(

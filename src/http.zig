@@ -71,6 +71,8 @@ const Request = struct {
     path: []const u8,
     session_id: ?[]const u8,
     protocol_version: ?[]const u8,
+    origin: ?[]const u8,
+    host: ?[]const u8,
     body: []const u8,
 };
 
@@ -177,6 +179,13 @@ fn handleConnection(
 
     if (!std.mem.eql(u8, req.path, "/mcp")) {
         respondJson(&conn, "404 Not Found", "{\"error\":\"not found\"}", null, PROTOCOL_VERSION);
+        return;
+    }
+
+    // Spec security guidance: validate Origin to prevent DNS-rebinding attacks
+    // from browser-based clients. Non-browser clients (no Origin) are allowed.
+    if (!originAllowed(req)) {
+        respondJson(&conn, "403 Forbidden", "{\"error\":\"origin not allowed\"}", null, PROTOCOL_VERSION);
         return;
     }
 
@@ -314,6 +323,11 @@ fn handlePost(
             respondJson(conn, "400 Bad Request", "{\"error\":\"mcp-protocol-version mismatch\"}", null, protocol_version);
             return;
         }
+    } else {
+        // 2025-11-25: the negotiated-version header is mandatory on all
+        // requests after initialize.
+        respondJson(conn, "400 Bad Request", "{\"error\":\"missing mcp-protocol-version\"}", null, protocol_version);
+        return;
     }
 
     if (scan.id_raw == null) {
@@ -366,13 +380,19 @@ fn appendToolCallResult(
 
     var tool_buf: std.ArrayList(u8) = .empty;
     defer tool_buf.deinit(allocator);
-    Registry.dispatchFast(allocator, io, tool, args_raw, &tool_buf);
+    const tool_ok = if (@hasDecl(Registry, "dispatchFastOk"))
+        Registry.dispatchFastOk(allocator, io, tool, args_raw, &tool_buf)
+    else blk: {
+        Registry.dispatchFast(allocator, io, tool, args_raw, &tool_buf);
+        break :blk true;
+    };
 
     body.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     body.appendSlice(allocator, scan.id_raw orelse "null") catch return;
     body.appendSlice(allocator, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
     json.writeEscaped(allocator, body, tool_buf.items);
-    body.appendSlice(allocator, "\"}],\"isError\":false") catch return;
+    body.appendSlice(allocator, "\"}],\"isError\":") catch return;
+    body.appendSlice(allocator, if (tool_ok) "false" else "true") catch return;
     if (tool_buf.items.len > 0 and tool_buf.items[0] == '{' and isValidJsonObject(tool_buf.items)) {
         body.appendSlice(allocator, ",\"structuredContent\":") catch return;
         body.appendSlice(allocator, tool_buf.items) catch return;
@@ -514,8 +534,23 @@ fn parseRequest(raw: []const u8) ?Request {
         .path = path,
         .session_id = headerValue(headers, "Mcp-Session-Id"),
         .protocol_version = headerValue(headers, "Mcp-Protocol-Version"),
+        .origin = headerValue(headers, "Origin"),
+        .host = headerValue(headers, "Host"),
         .body = body,
     };
+}
+
+/// Spec security guidance: a browser-supplied Origin whose host does not match
+/// the request's Host header indicates a cross-origin (DNS rebinding) attempt.
+/// No Origin header means a non-browser client and is allowed.
+fn originAllowed(req: Request) bool {
+    const origin = req.origin orelse return true;
+    const host = req.host orelse return true;
+    // Strip scheme (and any trailing path) from the origin before comparing.
+    var o = origin;
+    if (std.mem.indexOf(u8, o, "://")) |i| o = o[i + 3 ..];
+    if (std.mem.indexOfScalar(u8, o, '/')) |i| o = o[0..i];
+    return std.ascii.eqlIgnoreCase(o, host);
 }
 
 fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {

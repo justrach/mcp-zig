@@ -367,9 +367,16 @@ fn handleCall(
         writeErrorRaw(s, id_raw, -32602, "Unknown tool"); return;
     };
 
-    // Run handler into reusable tool_buf (clear, not free)
+    // Run handler into reusable tool_buf (clear, not free).
+    // Registries may expose dispatchFastOk to report handler failure — it
+    // feeds the result's `isError` flag; absent the hook, assume success.
     s.tool_buf.clearRetainingCapacity();
-    Registry.dispatchFast(alloc, s.io, tool, args_raw, &s.tool_buf);
+    const tool_ok = if (@hasDecl(Registry, "dispatchFastOk"))
+        Registry.dispatchFastOk(alloc, s.io, tool, args_raw, &s.tool_buf)
+    else blk: {
+        Registry.dispatchFast(alloc, s.io, tool, args_raw, &s.tool_buf);
+        break :blk true;
+    };
 
     // Build the complete JSON-RPC response directly into write_buf.
     const buf = &s.write_buf;
@@ -379,7 +386,8 @@ fn handleCall(
     buf.appendSlice(alloc, id_raw orelse "null") catch return;
     buf.appendSlice(alloc, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
     json.writeEscaped(alloc, buf, s.tool_buf.items);
-    buf.appendSlice(alloc, "\"}],\"isError\":false") catch return;
+    buf.appendSlice(alloc, "\"}],\"isError\":") catch return;
+    buf.appendSlice(alloc, if (tool_ok) "false" else "true") catch return;
 
     // If output looks like a JSON object, include as structuredContent
     if (s.tool_buf.items.len > 0 and s.tool_buf.items[0] == '{') {
