@@ -86,4 +86,18 @@ pub fn build(b: *std.Build) void {
     const package_example_install = b.addInstallArtifact(package_example, .{});
     const package_example_step = b.step("package-example", "Build the package-provider example");
     package_example_step.dependOn(&package_example_install.step);
+
+    // ── Cookbook example: a tiny kv-store product wrapped as MCP ────────────
+    const cookbook = b.addExecutable(.{
+        .name = "mcp-kv-store",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/kv-store/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    cookbook.root_module.addImport("mcp", mcp_module);
+    const cookbook_install = b.addInstallArtifact(cookbook, .{});
+    const cookbook_step = b.step("cookbook", "Build the kv-store cookbook example");
+    cookbook_step.dependOn(&cookbook_install.step);
 }

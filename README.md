@@ -143,6 +143,28 @@ const value = mcp.json.getStr(args, "key");
 Registries can additionally opt into 2026-07-28 features by declaring any of:
 `resources_list` / `prompts_list` fragments with `readResourceFast` / `getPromptFast` / `completeFast` hooks (capabilities are then advertised automatically), `dispatchFastRaw` for MRTR (`inputRequired` results), `dispatchFastOk` for accurate `isError`, and `discover_result` / `initialize_result` overrides. The client speaks modern MCP too: `client.useModern(.{ .name = "my-client", .version = "1.0" })` skips `initialize` entirely.
 
+### Cookbook: product → MCP in ~10 lines per function
+
+The fastest path — write plain Zig functions, register them with `registry.tool`, and the JSON Schema is **generated from the signature** at comptime:
+
+```zig
+fn kvGet(key: []const u8) []const u8 { ... }
+fn kvSet(alloc: std.mem.Allocator, key: []const u8, value: []const u8) ![]const u8 { ... }
+fn kvCount() i64 { ... }  // ints/bools are formatted as result text automatically
+
+const Tools = mcp.registry.Registry(&.{
+    mcp.registry.tool(kvSet, &.{ "alloc", "key", "value" }, .{ .name = "kv_set", .description = "Store a pair." }),
+    mcp.registry.tool(kvGet, &.{ "key" }, .{ .name = "kv_get", .description = "Fetch a value." }),
+    mcp.registry.tool(kvCount, &.{}, .{ .name = "kv_count", .description = "Count keys." }),
+});
+
+pub fn main(init: std.process.Init) !void {
+    mcp.runWithRegistry(init.gpa, init.io, Tools);
+}
+```
+
+Type mapping: `[]const u8` → required string, `i64` → optional integer (default 0), `bool` → optional boolean, `std.mem.Allocator` → injected and excluded from the schema. A complete runnable version (an in-memory kv-store with zero MCP imports in the product code) lives in [`examples/kv-store`](examples/kv-store) — `zig build cookbook` to run it.
+
 ---
 
 ## Structure

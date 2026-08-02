@@ -468,9 +468,9 @@ pub fn wrapFn(
         fn handler(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
             // Extract parameters at comptime
             var params: std.meta.ArgsTuple(F) = undefined;
-            inline for (info.params, 0..) |param, i| {
+            inline for (info.param_types, 0..) |param_type, i| {
                 const name_str = param_names[i];
-                const T = param.type.?;
+                const T = param_type orelse @compileError("wrapFn: anytype parameters are not supported");
 
                 if (T == []const u8) {
                     params[i] = json.getStr(args, name_str) orelse {
@@ -494,23 +494,160 @@ pub fn wrapFn(
             const ReturnType = info.return_type.?;
             if (@typeInfo(ReturnType) == .error_union) {
                 if (@call(.auto, func, params)) |result| {
-                    const R = @TypeOf(result);
-                    if (R == []const u8 or R == []u8) {
-                        out.appendSlice(alloc, result) catch {};
-                    }
+                    writeReturnValue(alloc, out, result);
                 } else |err| {
                     out.appendSlice(alloc, "error: ") catch {};
                     out.appendSlice(alloc, @errorName(err)) catch {};
                 }
             } else {
                 const result = @call(.auto, func, params);
-                if (ReturnType == []const u8 or ReturnType == []u8) {
-                    out.appendSlice(alloc, result) catch {};
-                }
-                // void return: nothing to write
+                writeReturnValue(alloc, out, result);
+            }
+        }
+
+        /// Emit a wrapped function's return value as tool result text.
+        /// Strings pass through; integers/bools are formatted; void is silent.
+        fn writeReturnValue(alloc: std.mem.Allocator, out: *std.ArrayList(u8), result: anytype) void {
+            const R = @TypeOf(result);
+            if (R == []const u8 or R == []u8) {
+                out.appendSlice(alloc, result) catch {};
+            } else if (R == void) {
+                // nothing to write
+            } else if (R == bool) {
+                out.appendSlice(alloc, if (result) "true" else "false") catch {};
+            } else if (@typeInfo(R) == .int) {
+                var tmp: [24]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{result}) catch return;
+                out.appendSlice(alloc, s) catch {};
+            } else {
+                @compileError("wrapFn: unsupported return type " ++ @typeName(R) ++ " (use []const u8, int, bool, or void)");
             }
         }
     }.handler;
+}
+
+// ── Comptime schema generation: write the function, get the tool ─────────────
+//
+// `wrapFn` already knows every parameter's name and type at comptime, so the
+// JSON Schema can be generated instead of hand-written. Type mapping matches
+// wrapFn's extraction semantics exactly:
+//
+//   []const u8  → {"type":"string"}   (required — wrapFn errors when missing)
+//   i64         → {"type":"integer"}  (optional — wrapFn defaults to 0)
+//   bool        → {"type":"boolean"}  (optional — wrapFn defaults to false)
+//   std.mem.Allocator → injected, excluded from the schema
+//
+// Example:
+//   fn greet(name: []const u8, excited: bool) []const u8 { ... }
+//   const Tools = registry.Registry(&.{
+//       registry.tool(greet, &.{ "name", "excited" }, .{
+//           .name = "greet", .description = "Greet someone.",
+//       }),
+//   });
+
+/// Generate a JSON Schema `inputSchema` object from a function's signature.
+/// `param_names` follows the wrapFn convention (one entry per parameter,
+/// including a placeholder for any Allocator parameter).
+pub fn inputSchemaFor(comptime func: anytype, comptime param_names: []const []const u8) []const u8 {
+    const info = @typeInfo(@TypeOf(func)).@"fn";
+    comptime {
+        var props: []const u8 = "";
+        var required: []const u8 = "";
+        var n_props: usize = 0;
+        var n_req: usize = 0;
+        for (info.param_types, 0..) |param_type, i| {
+            const T = param_type orelse @compileError("inputSchemaFor: anytype parameters are not supported");
+            if (T == std.mem.Allocator) continue;
+            const name = param_names[i];
+            const ty = switch (T) {
+                []const u8 => "string",
+                i64 => "integer",
+                bool => "boolean",
+                else => @compileError("inputSchemaFor: unsupported parameter type for '" ++ name ++ "'"),
+            };
+            if (n_props != 0) props = props ++ ",";
+            props = props ++ "\"" ++ name ++ "\":{\"type\":\"" ++ ty ++ "\"}";
+            if (T == []const u8) {
+                if (n_req != 0) required = required ++ ",";
+                required = required ++ "\"" ++ name ++ "\"";
+                n_req += 1;
+            }
+            n_props += 1;
+        }
+        return "{\"type\":\"object\",\"properties\":{" ++ props ++ "},\"required\":[" ++ required ++ "]}";
+    }
+}
+
+pub const FnToolOpts = struct {
+    name: []const u8,
+    description: []const u8,
+    title: ?[]const u8 = null,
+    annotations: ?[]const u8 = null,
+};
+
+/// One-step product-to-MCP: wrap a function AND generate its inputSchema.
+/// The returned ToolDef drops straight into `Registry(&.{...})`.
+pub fn tool(comptime func: anytype, comptime param_names: []const []const u8, comptime opts: FnToolOpts) ToolDef {
+    return .{
+        .name = opts.name,
+        .handler = wrapFn(func, param_names),
+        .title = opts.title,
+        .description = opts.description,
+        .input_schema = inputSchemaFor(func, param_names),
+        .annotations = opts.annotations,
+    };
+}
+
+test "inputSchemaFor generates schema from a function signature" {
+    const testing = std.testing;
+    const f = struct {
+        fn f(alloc: std.mem.Allocator, name: []const u8, count: i64, loud: bool) []const u8 {
+            _ = alloc;
+            _ = count;
+            _ = loud;
+            return name;
+        }
+    }.f;
+    const schema = comptime inputSchemaFor(f, &.{ "alloc", "name", "count", "loud" });
+    try testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"loud\":{\"type\":\"boolean\"}},\"required\":[\"name\"]}",
+        schema,
+    );
+    // no params at all → empty object schema
+    const g = struct {
+        fn g() void {}
+    }.g;
+    try testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
+        comptime inputSchemaFor(g, &.{}),
+    );
+}
+
+test "registry.tool wraps fn and generated schema into tools_list" {
+    const testing = std.testing;
+    const kv_get = struct {
+        fn kv_get(key: []const u8) []const u8 {
+            return key;
+        }
+    }.kv_get;
+    const Tools = Registry(&.{
+        tool(kv_get, &.{"key"}, .{
+            .name = "kv_get",
+            .title = "KV Get",
+            .description = "Fetch a value by key.",
+        }),
+    });
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"name\":\"kv_get\"") != null);
+    try testing.expect(std.mem.indexOf(u8, Tools.tools_list, "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}") != null);
+    // and the wrapped handler actually dispatches
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(testing.allocator);
+    try args.put(testing.allocator, "key", .{ .string = "hello" });
+    const t = Tools.parse("kv_get") orelse return error.TestUnexpectedResult;
+    Tools.dispatch(testing.allocator, t, &args, &out);
+    try testing.expectEqualStrings("hello", out.items);
 }
 
 test "Registry builds tools/list from library-style ToolDef fields" {
