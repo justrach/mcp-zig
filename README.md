@@ -97,7 +97,7 @@ The HTTP transport serves MCP JSON-RPC on `POST /mcp`. `initialize` returns an
 `Mcp-Session-Id` header; send that header on later `tools/list` and
 `tools/call` requests.
 
-Requires [Zig 0.16.0](https://ziglang.org/download/).
+Requires [Zig 0.17.0-dev](https://ziglang.org/download/) (master builds; `minimum_zig_version` in `build.zig.zon` enforces it — 0.16 and earlier are rejected). Verified against `0.17.0-dev.1525+91c6d8a09`.
 
 ---
 
@@ -139,6 +139,9 @@ pub fn main(init: std.process.Init) !void {
 const McpClient = mcp.client.McpClient;
 const value = mcp.json.getStr(args, "key");
 ```
+
+Registries can additionally opt into 2026-07-28 features by declaring any of:
+`resources_list` / `prompts_list` fragments with `readResourceFast` / `getPromptFast` / `completeFast` hooks (capabilities are then advertised automatically), `dispatchFastRaw` for MRTR (`inputRequired` results), `dispatchFastOk` for accurate `isError`, and `discover_result` / `initialize_result` overrides. The client speaks modern MCP too: `client.useModern(.{ .name = "my-client", .version = "1.0" })` skips `initialize` entirely.
 
 ---
 
