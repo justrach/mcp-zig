@@ -512,3 +512,35 @@ pub const HttpClient = struct {
         return out;
     }
 };
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test "HttpClient.init endpoint parsing" {
+    const testing = std.testing;
+
+    var c = try HttpClient.init(testing.allocator, undefined, "127.0.0.1:8000");
+    try testing.expectEqualStrings("127.0.0.1", c.host);
+    try testing.expectEqual(@as(u16, 8000), c.port);
+    try testing.expect(c.modern == null);
+    try testing.expect(c.bearer_token == null);
+
+    // http:// prefix + trailing slash
+    c = try HttpClient.init(testing.allocator, undefined, "http://example.local:9000/");
+    try testing.expectEqualStrings("example.local", c.host);
+    try testing.expectEqual(@as(u16, 9000), c.port);
+
+    // localhost normalizes to 127.0.0.1
+    c = try HttpClient.init(testing.allocator, undefined, "localhost:3000");
+    try testing.expectEqualStrings("127.0.0.1", c.host);
+    try testing.expectEqual(@as(u16, 3000), c.port);
+
+    // no port → error
+    try testing.expectError(error.InvalidEndpoint, HttpClient.init(testing.allocator, undefined, "noport"));
+
+    // useModern + setBearer mutate as expected
+    c = try HttpClient.init(testing.allocator, undefined, "127.0.0.1:8000");
+    c.useModern(.{ .name = "t", .version = "1" });
+    try testing.expectEqualStrings("2026-07-28", c.modern.?.protocol_version);
+    c.setBearer("tok");
+    try testing.expectEqualStrings("tok", c.bearer_token.?);
+}

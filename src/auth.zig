@@ -178,3 +178,38 @@ test "protected resource metadata shape" {
     try testing.expect(std.mem.indexOf(u8, out.items, "\"authorization_servers\":[\"me\"]") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"bearer_methods_supported\":[\"header\"]") != null);
 }
+
+test "HS256 JWT: non-HS256 alg, missing exp, bad base64, metadata without issuer" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const secret = "top-secret";
+    const now: i64 = 1_800_000_000;
+
+    // alg != HS256 must reject even with a valid HMAC
+    const none_header = "{\"alg\":\"none\"}";
+    const h64 = try b64urlEncodeAlloc(alloc, none_header);
+    defer alloc.free(h64);
+    const p64 = try b64urlEncodeAlloc(alloc, "{}");
+    defer alloc.free(p64);
+    const s64 = try b64urlEncodeAlloc(alloc, "x");
+    defer alloc.free(s64);
+    const fake = try std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ h64, p64, s64 });
+    defer alloc.free(fake);
+    try testing.expect(!validateHs256Jwt(secret, "", "", fake, now));
+
+    // no exp claim → allowed (exp is optional)
+    const no_exp = try mintTestJwt(alloc, secret, "{\"iss\":\"me\"}");
+    defer alloc.free(no_exp);
+    try testing.expect(validateHs256Jwt(secret, "me", "", no_exp, now));
+
+    // invalid base64 segments → reject, never panic
+    try testing.expect(!validateHs256Jwt(secret, "", "", "!!!.@@@.###", now));
+    try testing.expect(!validateHs256Jwt(secret, "", "", "..", now));
+    try testing.expect(!validateHs256Jwt(secret, "", "", "", now));
+
+    // metadata with empty issuer → empty authorization_servers array
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    appendProtectedResourceMetadata(alloc, &out, "http://h:1/mcp", "");
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"authorization_servers\":[]") != null);
+}

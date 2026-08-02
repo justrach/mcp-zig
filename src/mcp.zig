@@ -1158,3 +1158,46 @@ test "initialize result includes registry-aware capabilities" {
     try testing.expect(std.mem.indexOf(u8, result, "\"resources\":{\"listChanged\":false,\"subscribe\":false}") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"completions\":{}") != null);
 }
+
+test "appendResultValue meta injection edge cases" {
+    const testing = std.testing;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    // stamp on normal object: meta first, then original keys
+    appendResultValue(testing.allocator, &buf, "{\"tools\":[]}", true);
+    try testing.expectEqualStrings("{" ++ MODERN_RESULT_META ++ ",\"tools\":[]}", buf.items);
+
+    // stamp on empty object: no dangling comma
+    buf.clearRetainingCapacity();
+    appendResultValue(testing.allocator, &buf, "{}", true);
+    try testing.expectEqualStrings("{" ++ MODERN_RESULT_META ++ "}", buf.items);
+
+    // no stamp: verbatim (with newline stripping)
+    buf.clearRetainingCapacity();
+    appendResultValue(testing.allocator, &buf, "{\"a\":1}", false);
+    try testing.expectEqualStrings("{\"a\":1}", buf.items);
+
+    // stamp on non-object: verbatim fallback, no corruption
+    buf.clearRetainingCapacity();
+    appendResultValue(testing.allocator, &buf, "[1,2]", true);
+    try testing.expectEqualStrings("[1,2]", buf.items);
+}
+
+test "logLevelFromString round-trips all levels" {
+    const testing = std.testing;
+    inline for (std.meta.tags(LogLevel)) |lvl| {
+        try testing.expectEqual(lvl, logLevelFromString(@tagName(lvl)).?);
+    }
+    try testing.expect(logLevelFromString("verbose") == null);
+    try testing.expect(logLevelFromString("") == null);
+}
+
+test "SUPPORTED_VERSIONS_JSON matches the list" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("[\"2026-07-28\",\"2025-11-25\",\"2025-06-18\",\"2025-03-26\",\"2024-11-05\"]", SUPPORTED_VERSIONS_JSON);
+    // legacy list never includes the modern revision
+    for (LEGACY_PROTOCOL_VERSIONS) |v| {
+        try testing.expect(!std.mem.eql(u8, v, MODERN_PROTOCOL_VERSION));
+    }
+}

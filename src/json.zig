@@ -543,3 +543,96 @@ test "scanValue captures raw JSON values verbatim" {
     try testing.expectEqualStrings("2026-07-28", scanStr(meta, "io.modelcontextprotocol/protocolVersion").?);
     try testing.expect(scanValue(meta, "missing") == null);
 }
+
+test "scanJsonRpc: ids, notifications, results, meta fallback" {
+    const testing = std.testing;
+
+    // number id
+    var r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}");
+    try testing.expectEqualStrings("ping", r.method.?);
+    try testing.expectEqualStrings("42", r.id_raw.?);
+
+    // string id
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"ping\"}");
+    try testing.expectEqualStrings("\"abc-1\"", r.id_raw.?);
+
+    // notification: no id
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}");
+    try testing.expectEqualStrings("notifications/cancelled", r.method.?);
+    try testing.expect(r.id_raw == null);
+
+    // response detection
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    try testing.expect(r.method == null);
+    try testing.expect(r.has_result);
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601}}");
+    try testing.expect(r.has_error);
+
+    // params._meta fallback (top-level _meta absent)
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"k\":\"v\"}}}");
+    try testing.expect(r.params_raw != null);
+    try testing.expectEqualStrings("{\"k\":\"v\"}", r.meta_raw.?);
+
+    // top-level _meta wins over params._meta
+    r = scanJsonRpc("{\"jsonrpc\":\"2.0\",\"method\":\"m\",\"params\":{\"_meta\":{\"a\":\"1\"}},\"_meta\":{\"b\":\"2\"}}");
+    try testing.expectEqualStrings("{\"b\":\"2\"}", r.meta_raw.?);
+}
+
+test "scanStr/scanObj/scanBool/scanInt" {
+    const testing = std.testing;
+    const doc = "{\"name\":\"read\\\"file\",\"n\":-17,\"flag\":true,\"other\":false,\"obj\":{\"a\":1},\"arr\":[1,2]}";
+    try testing.expectEqualStrings("read\\\"file", scanStr(doc, "name").?);
+    try testing.expectEqual(@as(?i64, -17), scanInt(doc, "n"));
+    try testing.expect(scanBool(doc, "flag"));
+    try testing.expect(!scanBool(doc, "other"));
+    try testing.expect(!scanBool(doc, "missing"));
+    try testing.expectEqualStrings("{\"a\":1}", scanObj(doc, "obj").?);
+    try testing.expect(scanStr(doc, "n") == null); // not a string
+    try testing.expect(scanObj(doc, "arr") == null); // array, not object
+}
+
+test "getStr/getInt/getBool from ObjectMap" {
+    const testing = std.testing;
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(testing.allocator);
+    try args.put(testing.allocator, "s", .{ .string = "hello" });
+    try args.put(testing.allocator, "i", .{ .integer = 7 });
+    try args.put(testing.allocator, "b", .{ .bool = true });
+    try testing.expectEqualStrings("hello", getStr(&args, "s").?);
+    try testing.expect(getStr(&args, "i") == null);
+    try testing.expectEqual(@as(?i64, 7), getInt(&args, "i"));
+    try testing.expect(getInt(&args, "s") == null);
+    try testing.expect(getBool(&args, "b"));
+    try testing.expect(!getBool(&args, "missing"));
+}
+
+test "writeEscaped handles quotes, backslashes, newlines, controls" {
+    const testing = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    writeEscaped(testing.allocator, &out, "a\"b\\c\nd\te\x01");
+    try testing.expectEqualStrings("a\\\"b\\\\c\\nd\\te\\u0001", out.items);
+}
+
+test "metaStr and metaProtocolVersion" {
+    const testing = std.testing;
+    const meta = "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/logLevel\":\"debug\"}";
+    try testing.expectEqualStrings("debug", metaStr(meta, META_LOG_LEVEL).?);
+    try testing.expectEqualStrings("2026-07-28", metaProtocolVersion(meta).?);
+    try testing.expect(metaProtocolVersion(null) == null);
+    try testing.expect(metaStr(null, META_LOG_LEVEL) == null);
+}
+
+test "readLineBuf and readLineInto basics" {
+    const testing = std.testing;
+    const data = "line one\nline two\n";
+    var reader = std.Io.Reader.fixed(data);
+    const l1 = readLineBuf(testing.allocator, &reader).?;
+    defer testing.allocator.free(l1);
+    try testing.expectEqualStrings("line one", l1);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const l2 = readLineInto(testing.allocator, &reader, &buf).?;
+    try testing.expectEqualStrings("line two", l2);
+    try testing.expect(readLineInto(testing.allocator, &reader, &buf) == null);
+}

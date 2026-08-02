@@ -1071,3 +1071,197 @@ fn isValidJsonObject(data: []const u8) bool {
     }
     return false;
 }
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test "headerValue: case-insensitive names, trimming, missing" {
+    const testing = std.testing;
+    const headers = "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nmcp-session-id:  abc-123 \r\nX-Empty:\r\n";
+    try testing.expectEqualStrings("application/json", headerValue(headers, "content-type").?);
+    try testing.expectEqualStrings("abc-123", headerValue(headers, "Mcp-Session-Id").?);
+    try testing.expectEqualStrings("", headerValue(headers, "x-empty").?);
+    try testing.expect(headerValue(headers, "missing") == null);
+}
+
+test "parseRequest: method, path, headers, body, query strip" {
+    const testing = std.testing;
+    const raw = "POST /mcp?x=1 HTTP/1.1\r\nHost: h:1\r\nMcp-Method: tools/list\r\nMcp-Name: read_file\r\nAuthorization: Bearer tok\r\nLast-Event-ID: 9\r\nContent-Length: 4\r\n\r\nbody";
+    const req = parseRequest(raw).?;
+    try testing.expectEqualStrings("POST", req.method);
+    try testing.expectEqualStrings("/mcp", req.path);
+    try testing.expectEqualStrings("h:1", req.host.?);
+    try testing.expectEqualStrings("tools/list", req.mcp_method.?);
+    try testing.expectEqualStrings("read_file", req.mcp_name.?);
+    try testing.expectEqualStrings("Bearer tok", req.authorization.?);
+    try testing.expectEqualStrings("9", req.last_event_id.?);
+    try testing.expectEqualStrings("body", req.body);
+    try testing.expect(parseRequest("garbage without spaces") == null);
+}
+
+test "originAllowed: browser vs non-browser clients" {
+    const testing = std.testing;
+    _ = testing;
+    const base: Request = .{ .method = "POST", .path = "/mcp", .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = null, .origin = null, .host = null, .body = "" };
+    // no Origin header (non-browser) → allow
+    try std.testing.expect(originAllowed(base));
+    // matching origin (scheme + optional port variations)
+    try std.testing.expect(originAllowed(.{ .origin = "http://127.0.0.1:8000", .host = "127.0.0.1:8000", .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = null, .body = "" }));
+    // mismatched origin → reject
+    try std.testing.expect(!originAllowed(.{ .origin = "https://evil.example.com", .host = "127.0.0.1:8000", .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = null, .body = "" }));
+    // origin with trailing path still compares host part
+    try std.testing.expect(originAllowed(.{ .origin = "http://127.0.0.1:8000/some/path", .host = "127.0.0.1:8000", .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = null, .body = "" }));
+}
+
+test "bearerToken extraction" {
+    const testing = std.testing;
+    _ = testing;
+    const base: Request = .{ .method = "POST", .path = "/mcp", .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = null, .origin = null, .host = null, .body = "" };
+    try std.testing.expect(bearerToken(base) == null);
+    const with_tok: Request = .{ .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = "Bearer abc.def.ghi", .origin = null, .host = null, .body = "" };
+    try std.testing.expectEqualStrings("abc.def.ghi", bearerToken(with_tok).?);
+    const wrong_scheme: Request = .{ .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = "Basic abc", .origin = null, .host = null, .body = "" };
+    try std.testing.expect(bearerToken(wrong_scheme) == null);
+    const empty_tok: Request = .{ .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = "Bearer  ", .origin = null, .host = null, .body = "" };
+    try std.testing.expect(bearerToken(empty_tok) == null);
+    // case-insensitive scheme
+    const lower: Request = .{ .method = base.method, .path = base.path, .session_id = null, .protocol_version = null, .mcp_method = null, .mcp_name = null, .last_event_id = null, .authorization = "bearer xyz", .origin = null, .host = null, .body = "" };
+    try std.testing.expectEqualStrings("xyz", bearerToken(lower).?);
+}
+
+test "SessionStore create/getVersion/remove" {
+    const testing = std.testing;
+    var store = SessionStore.init(testing.allocator);
+    defer store.deinit();
+    const id = try store.create("2025-06-18");
+    try testing.expectEqualStrings("2025-06-18", store.getVersion(id).?);
+    try testing.expect(store.getVersion("nope") == null);
+    try testing.expect(store.remove(id));
+    try testing.expect(store.getVersion(id) == null);
+    try testing.expect(!store.remove(id));
+}
+
+test "appendRpcResultRawMeta injects _meta only for objects" {
+    const testing = std.testing;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+
+    appendRpcResultRawMeta(testing.allocator, &body, "1", "{\"tools\":[]}", true);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, ",\"tools\":[]}") != null);
+
+    body.clearRetainingCapacity();
+    appendRpcResultRawMeta(testing.allocator, &body, "2", "{}", true);
+    try testing.expect(std.mem.indexOf(u8, body.items, "{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":") != null);
+    // empty object: no trailing comma garbage
+    try testing.expect(std.mem.indexOf(u8, body.items, ",}") == null);
+
+    body.clearRetainingCapacity();
+    appendRpcResultRawMeta(testing.allocator, &body, "3", "{\"tools\":[]}", false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "_meta") == null);
+}
+
+test "appendUnsupportedProtocolVersion and appendHeaderMismatch shapes" {
+    const testing = std.testing;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    appendUnsupportedProtocolVersion(testing.allocator, &body, "7", "2099-01-01");
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32022") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"requested\":\"2099-01-01\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"2026-07-28\"") != null); // supported list
+
+    body.clearRetainingCapacity();
+    appendHeaderMismatch(testing.allocator, &body, "8", "missing Mcp-Method header");
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32020") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "missing Mcp-Method header") != null);
+}
+
+const mock_http_registry = struct {
+    pub const tools_list = "{\"tools\":[]}";
+    pub fn parse(name: []const u8) ?u0 {
+        _ = name;
+        return null;
+    }
+    pub fn dispatchFast(alloc: std.mem.Allocator, io: std.Io, tool: u0, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+        _ = alloc;
+        _ = io;
+        _ = tool;
+        _ = args_raw;
+        _ = out;
+    }
+    pub const resources_list = "{\"resources\":[{\"uri\":\"file:///a\"}]}";
+    pub fn readResourceFast(alloc: std.mem.Allocator, io: std.Io, uri: []const u8, out: *std.ArrayList(u8)) bool {
+        _ = io;
+        if (!std.mem.eql(u8, uri, "file:///a")) return false;
+        out.appendSlice(alloc, "[{\"uri\":\"file:///a\",\"text\":\"A\"}]") catch return false;
+        return true;
+    }
+};
+
+test "appendListRpcResult: modern wrap, legacy raw, missing decl" {
+    const testing = std.testing;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+
+    // modern: meta + resultType + ttlMs + cacheScope
+    appendListRpcResult(mock_http_registry, testing.allocator, &body, "1", "resources_list", true);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"ttlMs\":300000") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"resources\":[{\"uri\":\"file:///a\"}]") != null);
+
+    // legacy: raw fragment, no extras
+    body.clearRetainingCapacity();
+    appendListRpcResult(mock_http_registry, testing.allocator, &body, "2", "resources_list", false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "resultType") == null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"result\":{\"resources\":") != null);
+
+    // missing decl → -32601
+    body.clearRetainingCapacity();
+    appendListRpcResult(mock_http_registry, testing.allocator, &body, "3", "prompts_list", true);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32601") != null);
+}
+
+test "appendResourceReadRpc: success, missing uri, handler failure, absent decl" {
+    const testing = std.testing;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+
+    const ok_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"file:///a\"}}";
+    var scan = json.scanJsonRpc(ok_req);
+    appendResourceReadRpc(mock_http_registry, testing.allocator, undefined, &body, &scan, false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"contents\":[{\"uri\":\"file:///a\",\"text\":\"A\"}]") != null);
+
+    // missing uri
+    body.clearRetainingCapacity();
+    const no_uri = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{}}";
+    scan = json.scanJsonRpc(no_uri);
+    appendResourceReadRpc(mock_http_registry, testing.allocator, undefined, &body, &scan, false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32602") != null);
+
+    // handler failure → -32603
+    body.clearRetainingCapacity();
+    const bad_uri = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/read\",\"params\":{\"uri\":\"file:///nope\"}}";
+    scan = json.scanJsonRpc(bad_uri);
+    appendResourceReadRpc(mock_http_registry, testing.allocator, undefined, &body, &scan, false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32603") != null);
+
+    // registry without the decl → -32601
+    body.clearRetainingCapacity();
+    scan = json.scanJsonRpc(ok_req);
+    appendResourceReadRpc(mock_rpc_minimal, testing.allocator, undefined, &body, &scan, false);
+    try testing.expect(std.mem.indexOf(u8, body.items, "\"code\":-32601") != null);
+}
+
+const mock_rpc_minimal = struct {
+    pub const tools_list = "{\"tools\":[]}";
+    pub fn parse(name: []const u8) ?u0 {
+        _ = name;
+        return null;
+    }
+    pub fn dispatchFast(alloc: std.mem.Allocator, io: std.Io, tool: u0, args_raw: []const u8, out: *std.ArrayList(u8)) void {
+        _ = alloc;
+        _ = io;
+        _ = tool;
+        _ = args_raw;
+        _ = out;
+    }
+};
