@@ -465,7 +465,17 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 
 MRTR note: server-initiated requests (`roots/list` et al.) are legacy-only. Modern clients pass roots/project context as explicit tool arguments. Multi round-trip requests (MRTR) are supported via the optional `dispatchFastRaw` registry hook: it owns the entire result object (so tools can return `resultType:"inputRequired"` with `inputRequests` and a `requestState`), and the follow-up request's `params._meta` — including `inputResponses` — is forwarded to the hook for correlation.
 
-Resources/prompts/completions: registries may add `resources_list` / `prompts_list` JSON fragments plus `readResourceFast`, `getPromptFast`, and `completeFast` hooks; capabilities are then advertised automatically (legacy initialize and modern `server/discover` alike), and the methods serve on stdio and HTTP in both protocol modes with the schema-required fields. The client library also speaks modern MCP: `client.useModern(.{...})` skips initialize and stamps every request with `_meta` (see `McpClient.discover/listTools/callTool`).
+Resources/prompts/completions: registries may add `resources_list` / `prompts_list` JSON fragments plus `readResourceFast`, `getPromptFast`, and `completeFast` hooks; capabilities are then advertised automatically (legacy initialize and modern `server/discover` alike), and the methods serve on stdio and HTTP in both protocol modes with the schema-required fields. The client library also speaks modern MCP: `client.useModern(.{...})` skips initialize and stamps every request with `_meta` (see `McpClient.discover/listTools/callTool`), and `client.HttpClient` does the same over Streamable HTTP with the mirrored `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` headers (`http://` only — put TLS in front with a proxy).
+
+Progress/log notifications: a request's `_meta.progressToken` is captured per request (`Session.progress_token_raw`); tool calls that carried one get a terminal `notifications/progress` correlated to it, and `writeProgressNotification(Raw)` is available for long-running handlers. Log notifications honor the per-request `_meta` log level.
+
+### Authorization (HTTP)
+
+`http.Options.auth` enables bearer-token authorization per the 2026-07-28 security model: every MCP-endpoint request needs `Authorization: Bearer <token>`, failures get `401` + a `WWW-Authenticate` challenge, and the RFC 9728 protected-resource metadata document is served publicly at `/.well-known/oauth-protected-resource`. Two validation modes: built-in HS256 JWT (`AuthConfig{ .hs256_secret = ..., .issuer = ..., .audience = ... }`, checks signature/alg/exp/iss/aud), or a pluggable `validator` callback for your own token store. The standalone server takes `--auth-secret=<secret>`. Out of scope (documented in `src/auth.zig`): acting as an OAuth authorization server and RS*/ES* JWKS verification — plug those in via `validator`.
+
+### Conformance
+
+`./scripts/conformance.sh` runs the full dual-mode smoke matrix (23 checks: legacy byte-compat, modern stdio/HTTP shapes, error codes, header validation, Origin/403, SSE, progress) against `zig-out/bin/mcp-zig` and exits non-zero on failure — CI-ready. Property tests in `src/json.zig` fuzz the scanner with thousands of malformed inputs (the panic class found during development).
 
 MCP over stdio is **newline-delimited JSON-RPC 2.0** — one JSON object per line, no Content-Length headers (unlike LSP). The critical invariant: every write to stdout is exactly one JSON object followed by `\n`.
 

@@ -247,6 +247,11 @@ const Session = struct {
     // the _meta serverInfo envelope. Reset per request in the read loop.
     stamp_meta: bool = false,
 
+    // Raw JSON of the in-flight request's _meta.progressToken (string incl.
+    // quotes, or number), for correlating notifications/progress. Reset per
+    // request in the read loop. Null when the client sent no token.
+    progress_token_raw: ?[]const u8 = null,
+
     // Reusable buffers — allocated once, cleared between requests (Rust BytesMut pattern).
     // Avoids per-request alloc/free cycles in the hot path.
     write_buf: std.ArrayList(u8) = .empty,
@@ -325,6 +330,9 @@ pub fn runWithRegistry(alloc: std.mem.Allocator, io: std.Io, comptime Registry: 
         if (input.len == 0) continue;
 
         const scan = json.scanJsonRpc(input);
+
+        // Per-request progress correlation token (both protocol modes).
+        session.progress_token_raw = if (scan.meta_raw) |m| json.scanValue(m, "progressToken") else null;
 
         // 2026-07-28 modern gate: a request carrying _meta.protocolVersion opts
         // into stateless mode. Unknown versions get the spec-mandated
@@ -499,6 +507,12 @@ fn handleCall(
 
     buf.appendSlice(alloc, "}}\n") catch return;
     s.stdout.writeStreamingAll(s.io, buf.items) catch {};
+
+    // If the client supplied _meta.progressToken, close the loop with a
+    // terminal progress notification correlated to this request (both modes).
+    if (s.progress_token_raw) |token| {
+        writeProgressNotificationRaw(s, token, 1, 1, "done");
+    }
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -612,6 +626,29 @@ pub fn writeProgressNotification(
     }
     s.tool_buf.appendSlice(alloc, "}") catch return;
 
+    writeNotification(s, "notifications/progress", s.tool_buf.items);
+}
+
+/// Scanner-path variant: `token_raw` is the raw JSON fragment (e.g. "\"abc\""
+/// or 7) — typically `Session.progress_token_raw`, zero re-parsing.
+pub fn writeProgressNotificationRaw(s: *Session, token_raw: []const u8, progress: usize, total: usize, message: []const u8) void {
+    const alloc = s.alloc;
+    s.tool_buf.clearRetainingCapacity();
+    s.tool_buf.appendSlice(alloc, "{\"progressToken\":") catch return;
+    s.tool_buf.appendSlice(alloc, token_raw) catch return;
+    s.tool_buf.appendSlice(alloc, ",\"progress\":") catch return;
+    var tmp: [20]u8 = undefined;
+    const ps = std.fmt.bufPrint(&tmp, "{d}", .{progress}) catch return;
+    s.tool_buf.appendSlice(alloc, ps) catch return;
+    s.tool_buf.appendSlice(alloc, ",\"total\":") catch return;
+    const ts = std.fmt.bufPrint(&tmp, "{d}", .{total}) catch return;
+    s.tool_buf.appendSlice(alloc, ts) catch return;
+    if (message.len > 0) {
+        s.tool_buf.appendSlice(alloc, ",\"message\":\"") catch return;
+        json.writeEscaped(alloc, &s.tool_buf, message);
+        s.tool_buf.appendSlice(alloc, "\"") catch return;
+    }
+    s.tool_buf.appendSlice(alloc, "}") catch return;
     writeNotification(s, "notifications/progress", s.tool_buf.items);
 }
 

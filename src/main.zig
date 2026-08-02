@@ -27,12 +27,22 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--http")) {
             const endpoint = args.next() orelse "127.0.0.1:8000";
-            const opts = try parseHttpEndpoint(endpoint);
+            var opts = try parseHttpEndpoint(endpoint);
+            if (args.next()) |maybe_auth| {
+                if (std.mem.startsWith(u8, maybe_auth, "--auth-secret=")) {
+                    opts.auth = .{ .hs256_secret = maybe_auth["--auth-secret=".len..] };
+                }
+            }
             try http.serve(rt.io(), init.gpa, opts);
             return;
         }
         if (std.mem.startsWith(u8, arg, "--http=")) {
-            const opts = try parseHttpEndpoint(arg["--http=".len..]);
+            var opts = try parseHttpEndpoint(arg["--http=".len..]);
+            if (args.next()) |maybe_auth| {
+                if (std.mem.startsWith(u8, maybe_auth, "--auth-secret=")) {
+                    opts.auth = .{ .hs256_secret = maybe_auth["--auth-secret=".len..] };
+                }
+            }
             try http.serve(rt.io(), init.gpa, opts);
             return;
         }

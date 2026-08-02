@@ -158,6 +158,38 @@ pub fn metaStr(meta_raw: ?[]const u8, key: []const u8) ?[]const u8 {
     return scanStr(m, key);
 }
 
+/// Capture the raw JSON value for `key` — string (INCLUDING quotes), number,
+/// bool, null, or object/array — so it can be echoed verbatim (e.g.
+/// _meta.progressToken in notifications/progress).
+pub fn scanValue(data: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < data.len) {
+        while (i < data.len and data[i] != '"') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        const ks = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) break;
+        const k = data[ks..i];
+        i += 1;
+        while (i < data.len and data[i] != ':') : (i += 1) {}
+        if (i >= data.len) break;
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+        if (i >= data.len) break;
+
+        if (eql(k, key)) {
+            const vs = i;
+            skipJsonValue(data, &i);
+            return data[vs..@min(i, data.len)];
+        }
+        skipJsonValue(data, &i);
+    }
+    return null;
+}
+
 /// Extract the per-request protocol version a modern (2026-07-28) client
 /// stamps into `_meta`, if any. Null means a legacy (pre-2026-07-28) request.
 pub fn metaProtocolVersion(meta_raw: ?[]const u8) ?[]const u8 {
@@ -459,4 +491,55 @@ pub fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []cons
         }
         i += 1;
     }
+}
+
+// ── Robustness property tests ────────────────────────────────────────────────
+
+test "scanJsonRpc never panics on malformed input" {
+    const testing = std.testing;
+    _ = testing;
+    const seed = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"x\"},\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"progressToken\":\"t\"}}}";
+
+    // Every truncation point.
+    for (0..seed.len) |n| {
+        _ = scanJsonRpc(seed[0..n]);
+    }
+
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const rng = prng.random();
+    var buf: [512]u8 = undefined;
+
+    // Random single-byte mutations.
+    for (0..3000) |_| {
+        const n = rng.uintLessThan(usize, seed.len) + 1;
+        @memcpy(buf[0..n], seed[0..n]);
+        buf[rng.uintLessThan(usize, n)] = rng.int(u8);
+        _ = scanJsonRpc(buf[0..n]);
+    }
+
+    // Quote/backslash storms (historically the unterminated-string killers).
+    for (0..2000) |_| {
+        const n = rng.uintLessThan(usize, seed.len) + 1;
+        @memcpy(buf[0..n], seed[0..n]);
+        buf[rng.uintLessThan(usize, n)] = if (rng.boolean()) '"' else '\\';
+        const r = scanJsonRpc(buf[0..n]);
+        // Any captured slice must stay in-bounds.
+        if (r.params_raw) |p| {
+            const start = @intFromPtr(p.ptr) - @intFromPtr(buf[0..].ptr);
+            try std.testing.expect(start + p.len <= n);
+        }
+        if (r.meta_raw) |m| {
+            const start = @intFromPtr(m.ptr) - @intFromPtr(buf[0..].ptr);
+            try std.testing.expect(start + m.len <= n);
+        }
+    }
+}
+
+test "scanValue captures raw JSON values verbatim" {
+    const testing = std.testing;
+    const meta = "{\"progressToken\":\"tok-1\",\"n\":42,\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}";
+    try testing.expectEqualStrings("\"tok-1\"", scanValue(meta, "progressToken").?);
+    try testing.expectEqualStrings("42", scanValue(meta, "n").?);
+    try testing.expectEqualStrings("2026-07-28", scanStr(meta, "io.modelcontextprotocol/protocolVersion").?);
+    try testing.expect(scanValue(meta, "missing") == null);
 }

@@ -6,15 +6,22 @@
 const std = @import("std");
 const json = @import("json.zig");
 const protocol = @import("mcp.zig");
+const auth_mod = @import("auth.zig");
 const default_tools = @import("tools.zig");
 
 const PROTOCOL_VERSION = protocol.PROTOCOL_VERSION;
+
+pub const AuthConfig = auth_mod.AuthConfig;
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
 pub const Options = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8000,
+    /// When set, the MCP endpoint requires a valid `Authorization: Bearer`
+    /// token on every request (2026-07-28 security), and the RFC 9728
+    /// protected-resource metadata document is served publicly.
+    auth: ?AuthConfig = null,
 };
 
 const SessionStore = struct {
@@ -74,6 +81,7 @@ const Request = struct {
     mcp_method: ?[]const u8,
     mcp_name: ?[]const u8,
     last_event_id: ?[]const u8,
+    authorization: ?[]const u8,
     origin: ?[]const u8,
     host: ?[]const u8,
     body: []const u8,
@@ -127,7 +135,7 @@ pub fn serveWithRegistry(io: std.Io, allocator: std.mem.Allocator, opts: Options
             else => return err,
         };
         var detached = false;
-        handleConnection(Registry, io, allocator, stream, &sessions, &detached);
+        handleConnection(Registry, io, allocator, stream, &sessions, &detached, opts);
         if (!detached) stream.close(io);
     }
 }
@@ -145,6 +153,7 @@ fn handleConnection(
     stream: std.Io.net.Stream,
     sessions: *SessionStore,
     detached: *bool,
+    opts: Options,
 ) void {
     const request_buf = allocator.alloc(u8, MAX_REQUEST_BYTES) catch return;
     defer allocator.free(request_buf);
@@ -182,6 +191,15 @@ fn handleConnection(
         return;
     };
 
+    // RFC 9728: the protected-resource metadata document is PUBLIC — served
+    // without a token so clients can discover authorization requirements.
+    if (opts.auth) |a| {
+        if (std.mem.eql(u8, req.path, "/.well-known/oauth-protected-resource")) {
+            respondProtectedResourceMetadata(allocator, &conn, opts, a);
+            return;
+        }
+    }
+
     if (!std.mem.eql(u8, req.path, "/mcp")) {
         respondJson(&conn, "404 Not Found", "{\"error\":\"not found\"}", null, PROTOCOL_VERSION);
         return;
@@ -192,6 +210,20 @@ fn handleConnection(
     if (!originAllowed(req)) {
         respondJson(&conn, "403 Forbidden", "{\"error\":\"origin not allowed\"}", null, PROTOCOL_VERSION);
         return;
+    }
+
+    // Bearer-token gate (2026-07-28 security): every request to the MCP
+    // endpoint needs a valid token when auth is configured.
+    if (opts.auth) |a| {
+        const token = bearerToken(req) orelse {
+            respondUnauthorized(&conn, opts);
+            return;
+        };
+        const now_secs: i64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
+        if (!auth_mod.validate(a, token, now_secs)) {
+            respondUnauthorized(&conn, opts);
+            return;
+        }
     }
 
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
@@ -877,6 +909,40 @@ fn respondEmpty(conn: *Conn, status: []const u8, session_id: ?[]const u8, protoc
     respondJson(conn, status, "", session_id, protocol_version);
 }
 
+/// Extract the bearer token from the Authorization header, if present.
+fn bearerToken(req: Request) ?[]const u8 {
+    const h = req.authorization orelse return null;
+    if (h.len < 8 or !std.ascii.eqlIgnoreCase(h[0..7], "Bearer ")) return null;
+    const t = std.mem.trim(u8, h[7..], " \t");
+    return if (t.len == 0) null else t;
+}
+
+/// 401 + WWW-Authenticate challenge pointing at the metadata document (RFC 6750).
+fn respondUnauthorized(conn: *Conn, opts: Options) void {
+    var url_buf: [256]u8 = undefined;
+    const meta_url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/.well-known/oauth-protected-resource", .{ opts.host, opts.port }) catch return;
+    const body = "{\"error\":\"unauthorized\"}";
+    var hdr_buf: [1024]u8 = undefined;
+    const hdr = std.fmt.bufPrint(
+        &hdr_buf,
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nWWW-Authenticate: Bearer resource_metadata=\"{s}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        .{ body.len, meta_url },
+    ) catch return;
+    conn.writeAll(hdr);
+    conn.writeAll(body);
+    conn.flush();
+}
+
+/// RFC 9728 protected-resource metadata (public).
+fn respondProtectedResourceMetadata(allocator: std.mem.Allocator, conn: *Conn, opts: Options, a: AuthConfig) void {
+    var url_buf: [256]u8 = undefined;
+    const resource_url = std.fmt.bufPrint(&url_buf, "http://{s}:{d}/mcp", .{ opts.host, opts.port }) catch return;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    auth_mod.appendProtectedResourceMetadata(allocator, &body, resource_url, a.issuer);
+    respondJson(conn, "200 OK", body.items, null, PROTOCOL_VERSION);
+}
+
 /// Legacy (2025-03-26..2025-11-25) GET listener: opens a real SSE stream for
 /// the session. `Last-Event-ID` is parsed for the resume contract; this server
 /// has no notification sources, so the event store is empty, every event id a
@@ -941,6 +1007,7 @@ fn parseRequest(raw: []const u8) ?Request {
         .mcp_method = headerValue(headers, "Mcp-Method"),
         .mcp_name = headerValue(headers, "Mcp-Name"),
         .last_event_id = headerValue(headers, "Last-Event-ID"),
+        .authorization = headerValue(headers, "Authorization"),
         .origin = headerValue(headers, "Origin"),
         .host = headerValue(headers, "Host"),
         .body = body,
