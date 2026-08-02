@@ -19,6 +19,7 @@ pub const DEFAULT_INITIALIZE_RESULT = protocol.DEFAULT_INITIALIZE_RESULT;
 
 pub const http = @import("http.zig");
 pub const auth = @import("auth.zig");
+pub const oauth = @import("oauth.zig");
 pub const json = @import("json.zig");
 pub const registry = @import("registry.zig");
 pub const client = @import("client.zig");

@@ -465,7 +465,35 @@ codesign --sign - --force zig-out/bin/mcp-zig   # macOS Apple Silicon only
 
 MRTR note: server-initiated requests (`roots/list` et al.) are legacy-only. Modern clients pass roots/project context as explicit tool arguments. Multi round-trip requests (MRTR) are supported via the optional `dispatchFastRaw` registry hook: it owns the entire result object (so tools can return `resultType:"inputRequired"` with `inputRequests` and a `requestState`), and the follow-up request's `params._meta` — including `inputResponses` — is forwarded to the hook for correlation.
 
-Resources/prompts/completions: registries may add `resources_list` / `prompts_list` JSON fragments plus `readResourceFast`, `getPromptFast`, and `completeFast` hooks; capabilities are then advertised automatically (legacy initialize and modern `server/discover` alike), and the methods serve on stdio and HTTP in both protocol modes with the schema-required fields. The client library also speaks modern MCP: `client.useModern(.{...})` skips initialize and stamps every request with `_meta` (see `McpClient.discover/listTools/callTool`), and `client.HttpClient` does the same over Streamable HTTP with the mirrored `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` headers (`http://` only — put TLS in front with a proxy).
+Resources/prompts/completions: registries may add `resources_list` / `prompts_list` JSON fragments plus `readResourceFast`, `getPromptFast`, and `completeFast` hooks; capabilities are then advertised automatically (legacy initialize and modern `server/discover` alike), and the methods serve on stdio and HTTP in both protocol modes with the schema-required fields.
+
+The client library speaks modern MCP on both transports: `client.useModern(.{...})` skips initialize and stamps every request with `_meta` (stdio; see `McpClient.discover/listTools/callTool`), and `client.HttpClient` is a full Streamable HTTP client built on `std.http.Client` — **TLS included** (`https://` anywhere; plain `http://` loopback-only, enforced by `validRemoteUrl`), SSE (`text/event-stream`) response parsing per the spec's MUST-accept-both rule, hard request deadlines via `Io.Select` racing, spec-compliant base64 sentinel encoding for header-unsafe `Mcp-Name` values, and automatic era detection:
+
+```zig
+var c = try mcp.client.HttpClient.init(alloc, io, "https://mcp.example.com/mcp");
+defer c.deinit();
+switch (try c.probe()) {
+    .modern => c.useModern(.{ .name = "my-app", .version = "1.0" }),
+    .legacy => return error.LegacyServerUseStdio, // stdio client covers legacy
+    .unsupported_version => return error.NoCommonVersion,
+    .incompatible => return error.NotAnMcpServer,
+}
+if (c.discover()) |d| defer alloc.free(d) else |err| return err;
+const tools = try c.listTools();  // mirrored MCP-Protocol-Version/Mcp-Method/Mcp-Name headers
+```
+
+### OAuth 2.1 (remote servers with authorization)
+
+`mcp.oauth` implements the client side of the 2026-07-28 authorization model (ported from codegraff's proven flow): RFC 9728 challenge parsing + protected-resource discovery, AS metadata (oauth + OIDC), PKCE S256, dynamic client registration, authorization-code + refresh grants, and token persistence keyed by resource URL:
+
+```zig
+// one-time interactive login (opens the browser, listens for the callback):
+const tokens = try mcp.oauth.login(io, gpa, tokens_dir, "https://mcp.example.com/mcp", "my-app", "", mcp.oauth.default_redirect_uri);
+// later, silent:
+if (mcp.oauth.loadAccessToken(io, alloc, tokens_dir, "https://mcp.example.com/mcp", now_ms)) |tok| c.setBearer(tok);
+```
+
+Client ID Metadata Documents (the 2026-07-28-preferred alternative to dynamic registration) are not implemented — pass a pre-registered `client_id` to `login` for those servers.
 
 Progress/log notifications: a request's `_meta.progressToken` is captured per request (`Session.progress_token_raw`); tool calls that carried one get a terminal `notifications/progress` correlated to it, and `writeProgressNotification(Raw)` is available for long-running handlers. Log notifications honor the per-request `_meta` log level.
 
